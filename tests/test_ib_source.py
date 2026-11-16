@@ -4,7 +4,9 @@ import asyncio
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import pytest
 from ib_async.objects import BarData
+from ib_async.wrapper import RequestError
 
 from ibbt import ib_source
 
@@ -47,3 +49,88 @@ def test_missing_ranges_helper_used_by_backfill():
     assert ib_source.missing_ranges(None, date(2020, 1, 1), date(2020, 1, 31)) == [
         (date(2020, 1, 1), date(2020, 1, 31))
     ]
+
+
+class FlakyIB(FakeIB):
+    """Fails the first `failures` requests with `errors[i]`, then behaves like FakeIB."""
+
+    def __init__(self, errors: list[Exception]):
+        super().__init__()
+        self.errors = list(errors)
+
+    async def reqHistoricalDataAsync(self, contract, endDateTime, **kwargs):
+        if self.errors:
+            self.requests.append(endDateTime)
+            raise self.errors.pop(0)
+        return await super().reqHistoricalDataAsync(contract, endDateTime, **kwargs)
+
+
+class _Sleeps:
+    def __init__(self, monkeypatch):
+        self.delays: list[float] = []
+
+        async def fake_sleep(delay, *args, **kwargs):
+            self.delays.append(delay)
+
+        monkeypatch.setattr(ib_source.asyncio, "sleep", fake_sleep)
+
+
+def test_transient_error_is_retried_with_backoff(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+    sleeps = _Sleeps(monkeypatch)
+    ib = FlakyIB([ConnectionResetError("socket dropped")])
+
+    df = asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2022, 1, 3), date(2022, 6, 30)))
+
+    assert not df.empty
+    assert len(ib.requests) == 2  # one failure, one success for the same chunk
+    assert ib.requests[0] == ib.requests[1]
+    assert sleeps.delays[0] == ib_source.BACKOFF_SECONDS  # then the normal inter-chunk pause
+
+
+def test_pacing_violation_waits_sixty_seconds(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+    sleeps = _Sleeps(monkeypatch)
+    pacing = RuntimeError("Historical data request pacing violation")
+    ib = FlakyIB([pacing])
+
+    asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2022, 1, 3), date(2022, 6, 30)))
+
+    assert sleeps.delays[0] == 60
+
+
+def test_error_code_162_counts_as_pacing(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+    sleeps = _Sleeps(monkeypatch)
+    err = RequestError(1, 162, "Historical Market Data Service error message:")
+    ib = FlakyIB([err])
+
+    asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2022, 1, 3), date(2022, 6, 30)))
+
+    assert sleeps.delays[0] == 60
+
+
+def test_gives_up_after_three_attempts(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+    sleeps = _Sleeps(monkeypatch)
+    ib = FlakyIB([OSError("down")] * 5)
+
+    with pytest.raises(OSError, match="down"):
+        asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2022, 1, 3), date(2022, 6, 30)))
+
+    assert len(ib.requests) == ib_source.MAX_ATTEMPTS
+    assert sleeps.delays == [2.0, 4.0]  # exponential: 2s after attempt 1, 4s after attempt 2
+
+
+def test_on_chunk_receives_each_raw_chunk(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+    seen: list[pd.DataFrame] = []
+    ib = FakeIB()
+
+    df = asyncio.run(
+        ib_source.fetch_daily_bars(ib, "AAPL", date(2021, 1, 1), date(2023, 3, 31), on_chunk=seen.append)
+    )
+
+    assert len(seen) == len(ib.requests)
+    assert all(isinstance(c, pd.DataFrame) and not c.empty for c in seen)
+    assert len(df) <= sum(len(c) for c in seen)  # trimming never adds rows
