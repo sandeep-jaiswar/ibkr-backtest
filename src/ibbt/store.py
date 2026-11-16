@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS bars (
     volume DOUBLE,
     PRIMARY KEY (symbol, ts)
 );
+CREATE TABLE IF NOT EXISTS fetch_log (
+    symbol VARCHAR NOT NULL,
+    fetched_at TIMESTAMP NOT NULL,
+    start_date DATE,
+    end_date DATE,
+    rows INTEGER,
+    source VARCHAR
+);
 CREATE TABLE IF NOT EXISTS backtest_runs (
     run_id VARCHAR PRIMARY KEY,
     created_at TIMESTAMP NOT NULL,
@@ -89,6 +97,21 @@ class Store:
         if not rows or rows[0][0] is None:
             return None
         return rows[0][0], rows[0][1]
+
+    def log_fetch(
+        self,
+        *,
+        symbol: str,
+        start: date,
+        end: date,
+        rows: int,
+        source: str,
+    ) -> None:
+        """Record one fetch (what was requested and how many rows came back)."""
+        self.con.execute(
+            "INSERT INTO fetch_log VALUES (?, ?, ?, ?, ?, ?)",
+            [symbol, datetime.now(), start, end, rows, source],
+        )
 
     def upsert_bars(self, symbol: str, bars: pd.DataFrame) -> int:
         """Insert or replace daily bars. `bars` needs a `ts` column plus BAR_COLUMNS."""
