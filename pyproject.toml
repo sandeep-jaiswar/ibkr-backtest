@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ibkr-backtest"
+version = "0.1.0"
+description = "Backtest equity strategies on Interactive Brokers historical data, tracked with MLflow and persisted in DuckDB."
+requires-python = ">=3.11"
+dependencies = [
+    "ib_async>=2.0",
+    "duckdb>=1.1",
+    "mlflow>=3.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+ibbt = "ibbt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
