@@ -22,6 +22,11 @@ class BacktestConfig:
     initial_cash: float = 100_000.0
     commission_bps: float = 5.0  # per side, on notional
     slippage_bps: float = 5.0    # per side, adverse to the trader
+    position_fraction: float = 1.0  # share of idle cash deployed on each entry; the rest stays in cash
+
+    def __post_init__(self) -> None:
+        if not 0 < self.position_fraction <= 1:
+            raise ValueError(f"position_fraction must be in (0, 1], got {self.position_fraction}")
 
 
 @dataclass
@@ -63,20 +68,22 @@ def run_backtest(
 
         if order == 1 and shares == 0.0 and cash > 0.0:
             fill = opens[i] * (1 + slip)
-            shares = cash / (fill * (1 + comm))
-            cost_basis = cash
+            deployed = cash * cfg.position_fraction
+            shares = deployed / (fill * (1 + comm))
+            cost_basis = deployed
             entry_date, entry_price = index[i], fill
-            cash = 0.0
+            cash -= deployed  # the undeployed part stays idle as cash
         elif order == 0 and shares > 0.0:
             fill = opens[i] * (1 - slip)
-            cash = shares * fill * (1 - comm)
+            proceeds = shares * fill * (1 - comm)
+            cash += proceeds
             trades.append(
                 {
                     "entry_date": entry_date,
                     "entry_price": entry_price,
                     "exit_date": index[i],
                     "exit_price": fill,
-                    "pnl_pct": cash / cost_basis - 1,
+                    "pnl_pct": proceeds / cost_basis - 1,
                     "open": False,
                 }
             )

@@ -74,3 +74,46 @@ def test_sharpe_is_nan_for_constant_equity():
     position = pd.Series(0, index=equity.index)
     trades = pd.DataFrame(columns=["entry_date", "entry_price", "exit_date", "exit_price", "pnl_pct", "open"])
     assert math.isnan(compute_metrics(equity, trades, position)["sharpe"])
+
+
+def test_position_fraction_deploys_only_that_share_of_cash():
+    bars = _bars(opens=[100, 100, 100, 100, 100], closes=[100, 100, 100, 100, 100])
+    signal = pd.Series([1, 0, 0, 0, 0], index=bars.index)
+    cfg = BacktestConfig(commission_bps=0, slippage_bps=0, position_fraction=0.25)
+
+    result = run_backtest(bars, signal, cfg)
+
+    trade = result.trades.iloc[0]
+    assert trade["pnl_pct"] == pytest.approx(0.0)  # flat prices, no costs
+    # 25% of cash was deployed; the other 75% sat idle the whole time.
+    assert result.equity.iloc[1] == pytest.approx(100_000)
+    assert result.equity.iloc[-1] == pytest.approx(100_000)
+
+
+def test_position_fraction_scales_exposure_to_price_moves():
+    bars = _bars(opens=[100, 100, 110, 110], closes=[100, 100, 110, 110])
+    signal = pd.Series([1, 1, 0, 0], index=bars.index)
+    free = BacktestConfig(commission_bps=0, slippage_bps=0)
+    half = BacktestConfig(commission_bps=0, slippage_bps=0, position_fraction=0.5)
+
+    full_result = run_backtest(bars, signal, free)
+    half_result = run_backtest(bars, signal, half)
+
+    assert full_result.equity.iloc[-1] == pytest.approx(110_000)
+    assert half_result.equity.iloc[-1] == pytest.approx(105_000)
+    # The trade return is measured on the deployed capital, so it is unchanged by sizing.
+    assert half_result.trades.iloc[0]["pnl_pct"] == pytest.approx(0.10)
+
+
+def test_position_fraction_one_matches_default():
+    bars = _bars(opens=[100, 105, 98, 103], closes=[101, 104, 99, 102])
+    signal = pd.Series([1, 1, 0, 0], index=bars.index)
+    default = run_backtest(bars, signal, BacktestConfig())
+    explicit = run_backtest(bars, signal, BacktestConfig(position_fraction=1.0))
+    pd.testing.assert_series_equal(default.equity, explicit.equity)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.5, 1.01, 2.0])
+def test_position_fraction_outside_zero_one_is_rejected(bad):
+    with pytest.raises(ValueError):
+        BacktestConfig(position_fraction=bad)
