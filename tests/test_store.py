@@ -58,3 +58,16 @@ def test_run_persists_runs_trades_and_equity(tmp_path):
         assert store.con.execute("SELECT count(*) FROM trades WHERE run_id='r1'").fetchall()[0][0] == len(result.trades)
         runs = store.list_runs()
         assert list(runs["run_id"]) == ["r1"]
+
+
+def test_log_fetch_records_request_and_row_count(tmp_path):
+    with Store(tmp_path / "m.duckdb") as store:
+        store.log_fetch(symbol="ABC", start=date(2022, 1, 3), end=date(2022, 3, 31), rows=60, source="ib")
+
+        rows = store.con.execute(
+            "SELECT symbol, start_date, end_date, rows, source, fetched_at FROM fetch_log"
+        ).fetchall()
+        assert len(rows) == 1
+        symbol, start, end, n, source, fetched_at = rows[0]
+        assert (symbol, start, end, n, source) == ("ABC", date(2022, 1, 3), date(2022, 3, 31), 60, "ib")
+        assert fetched_at is not None
