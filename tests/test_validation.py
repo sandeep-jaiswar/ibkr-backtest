@@ -90,9 +90,7 @@ def test_walk_forward_eval_picks_best_train_sharpe_and_scores_test_only():
             train_sharpes[(params["fast"], params["slow"])] = compute_metrics(
                 result.equity, result.trades, result.position
             )["sharpe"]
-        best = max(
-            (sharpe, key) for key, sharpe in train_sharpes.items() if not math.isnan(sharpe)
-        )[1]
+        best = max((sharpe, key) for key, sharpe in train_sharpes.items() if not math.isnan(sharpe))[1]
         assert (int(out.loc[k, "fast"]), int(out.loc[k, "slow"])) == best
 
         # Out-of-sample metrics equal running the chosen params on the test window alone.
@@ -121,7 +119,7 @@ def test_walk_forward_eval_ignores_bars_after_a_fold_test_window():
 def test_walk_forward_eval_skips_invalid_grid_entries():
     bars = _bars()
     out = walk_forward_eval(bars, "sma_crossover", [GRID[3], GRID[0]], CFG, 2, 3, 1)
-    assert set(zip(out["fast"].astype(int), out["slow"].astype(int))) == {(5, 20)}
+    assert set(zip(out["fast"].astype(int), out["slow"].astype(int), strict=True)) == {(5, 20)}
 
 
 def test_walk_forward_eval_raises_when_no_grid_entry_is_valid():

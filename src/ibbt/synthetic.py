@@ -26,6 +26,4 @@ def synthetic_bars(
     low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.004, n)))
     volume = rng.integers(1_000_000, 5_000_000, n).astype(float)
 
-    return pd.DataFrame(
-        {"ts": dates, "open": open_, "high": high, "low": low, "close": close, "volume": volume}
-    )
+    return pd.DataFrame({"ts": dates, "open": open_, "high": high, "low": low, "close": close, "volume": volume})

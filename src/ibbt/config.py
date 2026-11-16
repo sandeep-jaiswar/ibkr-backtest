@@ -18,7 +18,7 @@ class Settings:
     mlflow_experiment: str = "ibkr-backtests"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         return cls(
             ib_host=os.getenv("IBKR_HOST", "127.0.0.1"),
             ib_port=int(os.getenv("IBKR_PORT", "7497")),

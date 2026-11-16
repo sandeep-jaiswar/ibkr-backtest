@@ -63,10 +63,7 @@ CREATE TABLE IF NOT EXISTS equity_curves (
 
 def _clean(values: dict[str, Any]) -> dict[str, Any]:
     """Replace NaN with None so the JSON stored in DuckDB is valid."""
-    return {
-        k: (None if isinstance(v, float) and math.isnan(v) else v)
-        for k, v in values.items()
-    }
+    return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in values.items()}
 
 
 class Store:
@@ -81,7 +78,7 @@ class Store:
     def close(self) -> None:
         self.con.close()
 
-    def __enter__(self) -> "Store":
+    def __enter__(self) -> Store:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -91,9 +88,7 @@ class Store:
 
     def coverage(self, symbol: str) -> tuple[date, date] | None:
         """Return (first, last) stored bar date for a symbol, or None if empty."""
-        rows = self.con.execute(
-            "SELECT min(ts), max(ts) FROM bars WHERE symbol = ?", [symbol]
-        ).fetchall()
+        rows = self.con.execute("SELECT min(ts), max(ts) FROM bars WHERE symbol = ?", [symbol]).fetchall()
         if not rows or rows[0][0] is None:
             return None
         return rows[0][0], rows[0][1]
@@ -127,8 +122,7 @@ class Store:
         self.con.register("incoming_bars", frame)
         try:
             self.con.execute(
-                "INSERT OR REPLACE INTO bars "
-                "SELECT symbol, ts, open, high, low, close, volume FROM incoming_bars"
+                "INSERT OR REPLACE INTO bars SELECT symbol, ts, open, high, low, close, volume FROM incoming_bars"
             )
         finally:
             self.con.unregister("incoming_bars")
@@ -137,8 +131,7 @@ class Store:
     def load_bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         """Return bars indexed by a DatetimeIndex named `ts`."""
         df = self.con.execute(
-            "SELECT ts, open, high, low, close, volume FROM bars "
-            "WHERE symbol = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+            "SELECT ts, open, high, low, close, volume FROM bars WHERE symbol = ? AND ts BETWEEN ? AND ? ORDER BY ts",
             [symbol, start, end],
         ).df()
         df["ts"] = pd.to_datetime(df["ts"])

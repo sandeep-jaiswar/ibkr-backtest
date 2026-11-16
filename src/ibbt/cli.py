@@ -12,13 +12,14 @@ from typing import Any
 import mlflow
 import pandas as pd
 
-from ibbt import ib_source, tracking
+from ibbt import checks, ib_source, report, tracking
 from ibbt.config import Settings
 from ibbt.engine import BacktestConfig
 from ibbt.runner import run_and_record
 from ibbt.store import Store
 from ibbt.strategies import REGISTRY
 from ibbt.synthetic import synthetic_bars
+from ibbt.validation import overfit_warning, walk_forward_eval
 
 DEMO_SYMBOL = "SYNTH"
 
@@ -65,6 +66,7 @@ def _add_backtest_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cash", type=float, default=100_000.0, help="initial cash")
     p.add_argument("--commission-bps", type=float, default=5.0)
     p.add_argument("--slippage-bps", type=float, default=5.0)
+    p.add_argument("--position-fraction", type=float, default=1.0, help="share of cash deployed, (0, 1]")
     p.add_argument("--no-track", action="store_true", help="skip MLflow logging")
 
 
@@ -73,6 +75,7 @@ def _cfg(args: argparse.Namespace) -> BacktestConfig:
         initial_cash=args.cash,
         commission_bps=args.commission_bps,
         slippage_bps=args.slippage_bps,
+        position_fraction=args.position_fraction,
     )
 
 
@@ -104,6 +107,7 @@ async def _backfill(
             for gap_start, gap_end in gaps:
                 bars = await ib_source.fetch_daily_bars(ib, symbol, gap_start, gap_end, exchange, currency)
                 written = store.upsert_bars(symbol, bars)
+                store.log_fetch(symbol=symbol, start=gap_start, end=gap_end, rows=written, source="IB")
                 print(f"{symbol}: stored {written} bars for {gap_start}..{gap_end}")
 
 
@@ -146,7 +150,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     grid = _parse_grid(args.grid)
     keys = list(grid)
-    combos = [dict(zip(keys, values)) for values in itertools.product(*grid.values())]
+    combos = [dict(zip(keys, values, strict=True)) for values in itertools.product(*grid.values())]
     rows: list[dict[str, Any]] = []
 
     with Store(settings.duckdb_path) as store:
@@ -178,6 +182,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     cols = [*keys, "total_return", "cagr", "sharpe", "max_drawdown", "round_trips", "run_id"]
     print(table[cols].head(args.top).to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print(f"\n{len(rows)} runs. Sorted by Sharpe; open the MLflow UI to compare them.")
+    warning = overfit_warning(table, keys)
+    if warning:
+        print(f"warning: {warning}")
     return 0
 
 
@@ -200,6 +207,22 @@ def cmd_demo(args: argparse.Namespace) -> int:
         )
     print(f"demo run {out.run_id} on synthetic {DEMO_SYMBOL} data")
     _print_metrics(out.metrics)
+    return 0
+
+
+def cmd_walk_forward(args: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    grid = _parse_grid(args.grid)
+    keys = list(grid)
+    combos = [dict(zip(keys, values, strict=True)) for values in itertools.product(*grid.values())]
+    with Store(settings.duckdb_path) as store:
+        bars = store.load_bars(args.symbol, args.start, args.end)
+    if bars.empty:
+        raise LookupError(f"no stored bars for {args.symbol}; run `ibbt fetch` first")
+    result = walk_forward_eval(bars, args.strategy, combos, _cfg(args), args.folds, args.train_years, args.test_years)
+    print(result.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    oos = result["oos_sharpe"].mean() if "oos_sharpe" in result else float("nan")
+    print(f"\nmean out-of-sample sharpe: {oos:.4f} across {len(result)} folds")
     return 0
 
 
@@ -243,6 +266,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("demo", help="offline run on synthetic data (no IB needed)")
     p.add_argument("--no-track", action="store_true")
     p.set_defaults(func=cmd_demo)
+
+    p = sub.add_parser("walk-forward", help="rolling train/test selection with out-of-sample results")
+    _add_backtest_args(p)
+    p.add_argument("--grid", action="append", metavar="KEY=V1,V2", help="repeatable")
+    p.add_argument("--folds", type=int, default=3)
+    p.add_argument("--train-years", type=int, default=3)
+    p.add_argument("--test-years", type=int, default=1)
+    p.set_defaults(func=cmd_walk_forward)
+
+    checks.register(sub)
+    report.register(sub)
 
     p = sub.add_parser("runs", help="list stored backtest runs")
     p.add_argument("--limit", type=int, default=20)

@@ -69,8 +69,7 @@ def walk_forward_splits(
         train_start = test_start - pd.DateOffset(years=train_years)
         if train_start < index[0]:
             raise ValueError(
-                f"fold {k} needs train data from {train_start.date()}, "
-                f"but the index starts {index[0].date()}"
+                f"fold {k} needs train data from {train_start.date()}, but the index starts {index[0].date()}"
             )
         train = _date_slice(index, train_start, test_start, f"fold {k} train")
         test = _date_slice(index, test_start, test_stop, f"fold {k} test")
@@ -176,7 +175,6 @@ def overfit_warning(grid_results: pd.DataFrame, param_cols: list[str]) -> str | 
         else:
             continue
         messages.append(
-            f"best sharpe is at the {edge} of {col!r} ({best_value}); "
-            "the optimum may lie outside the searched grid"
+            f"best sharpe is at the {edge} of {col!r} ({best_value}); the optimum may lie outside the searched grid"
         )
     return "; ".join(messages) if messages else None

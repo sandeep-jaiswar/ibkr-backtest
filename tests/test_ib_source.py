@@ -1,6 +1,6 @@
 """Exercises the IB fetch loop against a fake client, so no gateway is needed."""
-import asyncio
 
+import asyncio
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -26,7 +26,9 @@ class FakeIB:
         end = datetime.strptime(endDateTime, "%Y%m%d %H:%M:%S").date()
         days = pd.bdate_range(end - timedelta(days=365), end - timedelta(days=1))
         return [
-            BarData(date=d.date(), open=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0, average=100.2, barCount=5)
+            BarData(
+                date=d.date(), open=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0, average=100.2, barCount=5
+            )
             for d in days
         ]
 
@@ -127,9 +129,7 @@ def test_on_chunk_receives_each_raw_chunk(monkeypatch):
     seen: list[pd.DataFrame] = []
     ib = FakeIB()
 
-    df = asyncio.run(
-        ib_source.fetch_daily_bars(ib, "AAPL", date(2021, 1, 1), date(2023, 3, 31), on_chunk=seen.append)
-    )
+    df = asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2021, 1, 1), date(2023, 3, 31), on_chunk=seen.append))
 
     assert len(seen) == len(ib.requests)
     assert all(isinstance(c, pd.DataFrame) and not c.empty for c in seen)

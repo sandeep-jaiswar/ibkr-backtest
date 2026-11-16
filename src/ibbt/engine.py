@@ -21,7 +21,7 @@ TRADE_COLUMNS = ["entry_date", "entry_price", "exit_date", "exit_price", "pnl_pc
 class BacktestConfig:
     initial_cash: float = 100_000.0
     commission_bps: float = 5.0  # per side, on notional
-    slippage_bps: float = 5.0    # per side, adverse to the trader
+    slippage_bps: float = 5.0  # per side, adverse to the trader
     position_fraction: float = 1.0  # share of idle cash deployed on each entry; the rest stays in cash
 
     def __post_init__(self) -> None:
@@ -31,16 +31,17 @@ class BacktestConfig:
 
 @dataclass
 class BacktestResult:
-    equity: pd.Series      # indexed by bar date
-    position: pd.Series    # 1 when holding shares at the bar's close, else 0
-    trades: pd.DataFrame   # one row per round trip; `open` marks a position still held at the end
+    equity: pd.Series  # indexed by bar date
+    position: pd.Series  # 1 when holding shares at the bar's close, else 0
+    trades: pd.DataFrame  # one row per round trip; `open` marks a position still held at the end
 
 
 def run_backtest(
     bars: pd.DataFrame,
     signal: pd.Series,
-    cfg: BacktestConfig = BacktestConfig(),
+    cfg: BacktestConfig | None = None,
 ) -> BacktestResult:
+    cfg = cfg or BacktestConfig()
     if bars.empty:
         raise ValueError("cannot backtest an empty price series")
 

@@ -61,14 +61,23 @@ ibbt backtest AAPL --strategy sma_crossover --param fast=20 --param slow=100 --s
 # 3. Grid-search parameters. Each combination is an MLflow child run under one parent.
 ibbt sweep AAPL --strategy sma_crossover --grid fast=10,20,50 --grid slow=100,200
 
-# 4. Inspect stored runs
+# 4. Walk-forward: pick parameters on a train window, score on the next test window
+ibbt walk-forward AAPL --grid fast=10,20,50 --grid slow=100,200 --folds 3 --train-years 3 --test-years 1
+
+# 5. Check stored data for gaps and bad bars
+ibbt check AAPL MSFT
+
+# 6. Self-contained HTML tear sheet for a run
+ibbt report <run_id> --out reports/run.html
+
+# 7. Inspect stored runs
 ibbt runs
 
 # MLflow UI
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
-Costs are set with `--cash`, `--commission-bps` (default 5) and `--slippage-bps` (default 5).
+Costs are set with `--cash`, `--commission-bps` (default 5) and `--slippage-bps` (default 5). `--position-fraction` (0 to 1] sets how much cash is deployed on entry.
 
 ### Querying DuckDB directly
 
@@ -86,7 +95,9 @@ SELECT * FROM trades WHERE run_id = '<run_id>' ORDER BY entry_date;
 
 - **No look-ahead.** A signal computed from bar *t*'s close becomes an order that fills at bar *t+1*'s open. Strategies must only use data up to their own bar. A test enforces this for the SMA strategy.
 - **Costs.** Commission is charged on notional on each side, and slippage moves each fill against the trader.
-- **Long/flat only.** Each strategy goes all-in or fully flat, with fractional shares.
+- **Long/flat only.** Each strategy goes long or flat. Entries deploy `--position-fraction` of cash, and the rest stays idle.
+- **Benchmark.** Every run also reports buy-and-hold total return and CAGR on the same dates and costs.
+- **Strategies.** `sma_crossover` and `donchian_breakout` (entry above the prior high, exit below the prior low).
 - **Metrics.** Total return, CAGR, annualised volatility, Sharpe (risk-free rate 0, 252 periods), max drawdown, Calmar, time in market, round trips, win rate and average trade P&L.
 
 ### Known limitations

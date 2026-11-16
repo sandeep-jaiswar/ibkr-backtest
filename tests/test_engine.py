@@ -22,7 +22,7 @@ def test_signal_fills_at_next_open_not_same_bar_close():
     assert len(result.trades) == 1
     trade = result.trades.iloc[0]
     assert trade["entry_price"] == pytest.approx(101)  # open of bar 1, not bar 0's close
-    assert trade["exit_price"] == pytest.approx(102)   # open of bar 2
+    assert trade["exit_price"] == pytest.approx(102)  # open of bar 2
     assert not trade["open"]
 
 

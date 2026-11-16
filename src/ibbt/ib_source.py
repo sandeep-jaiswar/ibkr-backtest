@@ -38,7 +38,7 @@ async def connect(settings: Settings) -> AsyncIterator[IB]:
             timeout=20,
             readonly=True,
         )
-    except (OSError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, OSError) as exc:
         raise ConnectionError(
             f"could not connect to IB at {settings.ib_host}:{settings.ib_port}. "
             "Is TWS or IB Gateway running with API access enabled?"
@@ -75,15 +75,17 @@ async def _request_chunk(ib: IB, contract: Any, end_str: str) -> Any:
                 delay = BACKOFF_SECONDS * 2 ** (attempt - 1)
             logger.warning(
                 "historical request ending %s failed (attempt %d/%d): %s; retrying in %.0fs",
-                end_str, attempt, MAX_ATTEMPTS, exc, delay,
+                end_str,
+                attempt,
+                MAX_ATTEMPTS,
+                exc,
+                delay,
             )
             await asyncio.sleep(delay)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def missing_ranges(
-    coverage: tuple[date, date] | None, start: date, end: date
-) -> list[tuple[date, date]]:
+def missing_ranges(coverage: tuple[date, date] | None, start: date, end: date) -> list[tuple[date, date]]:
     """Date ranges not yet in the store. Assumes stored data is contiguous."""
     if coverage is None:
         return [(start, end)]
@@ -111,10 +113,12 @@ async def fetch_daily_bars(
     `on_chunk` receives each raw (untrimmed) chunk as it arrives, so callers can
     persist progress before the whole range is done.
     """
-    qualified = await ib.qualifyContractsAsync(Stock(symbol, exchange, currency))
-    if not qualified or not qualified[0].conId:
+    raw = await ib.qualifyContractsAsync(Stock(symbol, exchange, currency))
+    candidates: list[Any] = list(raw) if isinstance(raw, list) else [raw]
+    resolved = [c for c in candidates if c is not None and c.conId]
+    if not resolved:
         raise ValueError(f"IB could not resolve contract for {symbol} ({exchange}/{currency})")
-    contract = qualified[0]
+    contract = resolved[0]
 
     frames: list[pd.DataFrame] = []
     cursor = end + timedelta(days=1)  # IB's endDateTime is exclusive at midnight

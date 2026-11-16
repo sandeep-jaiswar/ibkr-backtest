@@ -35,7 +35,8 @@ def check_symbol(store: Store, symbol: str, start: date, end: date) -> dict[str,
     expected = [d.date() for d in pd.bdate_range(start, end)]
 
     def count(condition: str) -> int:
-        return con.execute(f"SELECT count(*) FROM bars WHERE {where} AND ({condition})", params).fetchone()[0]
+        row = con.execute(f"SELECT count(*) FROM bars WHERE {where} AND ({condition})", params).fetchall()
+        return int(row[0][0])
 
     return {
         "symbol": symbol,
