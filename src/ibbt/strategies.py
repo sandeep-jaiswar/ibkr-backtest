@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
+import numpy as np
 import pandas as pd
 
 
@@ -53,7 +54,48 @@ class SmaCrossover(Strategy):
         return (fast_ma > slow_ma).astype(int)
 
 
-REGISTRY: dict[str, type[Strategy]] = {s.name: s for s in (BuyAndHold, SmaCrossover)}
+class DonchianBreakout(Strategy):
+    """Donchian channel breakout.
+
+    Enter long when the close exceeds the highest high of the prior `lookback` bars.
+    Exit when the close falls below the lowest low of the prior `exit_lookback` bars.
+    The channel is shifted by one bar, so the current bar never widens its own channel.
+    Stateful (the exit depends on whether we are already long), so it walks the bars in a loop.
+    """
+
+    name = "donchian_breakout"
+
+    def __init__(self, lookback: int = 55, exit_lookback: int = 20):
+        lookback, exit_lookback = int(lookback), int(exit_lookback)
+        if exit_lookback < 1 or exit_lookback >= lookback:
+            raise ValueError(
+                "donchian_breakout needs 1 <= exit_lookback < lookback, "
+                f"got lookback={lookback} exit_lookback={exit_lookback}"
+            )
+        self.lookback = lookback
+        self.exit_lookback = exit_lookback
+
+    def params(self) -> dict[str, Any]:
+        return {"lookback": self.lookback, "exit_lookback": self.exit_lookback}
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].to_numpy(dtype=float)
+        upper = bars["high"].rolling(self.lookback).max().shift(1).to_numpy(dtype=float)
+        lower = bars["low"].rolling(self.exit_lookback).min().shift(1).to_numpy(dtype=float)
+
+        out = np.zeros(len(close), dtype=int)
+        holding = 0
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if holding == 0 and close[i] > upper[i]:
+                holding = 1
+            elif holding == 1 and close[i] < lower[i]:
+                holding = 0
+            out[i] = holding
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
+REGISTRY: dict[str, type[Strategy]] = {s.name: s for s in (BuyAndHold, SmaCrossover, DonchianBreakout)}
 
 
 def make_strategy(name: str, params: dict[str, Any] | None = None) -> Strategy:
