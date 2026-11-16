@@ -13,6 +13,7 @@ from ibbt.engine import BacktestConfig, BacktestResult, run_backtest
 from ibbt.metrics import compute_metrics
 from ibbt.store import Store
 from ibbt.strategies import make_strategy
+from ibbt.validation import benchmark_metrics
 
 
 @dataclass
@@ -42,6 +43,13 @@ def run_and_record(
     strategy = make_strategy(strategy_name, strategy_params)
     result = run_backtest(bars, strategy.signal(bars), cfg)
     metrics = compute_metrics(result.equity, result.trades, result.position)
+    # Buy-and-hold under the same costs and sizing, so runs can be compared with simply holding.
+    benchmark = benchmark_metrics(bars, cfg)
+    metrics = {
+        **metrics,
+        "benchmark_total_return": benchmark["total_return"],
+        "benchmark_cagr": benchmark["cagr"],
+    }
     params = {**strategy.params(), **asdict(cfg)}
 
     run_id = uuid.uuid4().hex[:12]
