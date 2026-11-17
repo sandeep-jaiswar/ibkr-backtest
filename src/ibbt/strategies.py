@@ -556,6 +556,116 @@ class ChampionDailySetup(Strategy):
         return cond.fillna(False).astype(int).rename("signal")
 
 
+def _rma(x: np.ndarray, n: int) -> np.ndarray:
+    """Wilder's moving average, matching Pine's `ta.rma`.
+
+    Seeded with the simple average of the first `n` values, then
+    rma_t = rma_{t-1} + (x_t - rma_{t-1}) / n. NaN inputs are skipped and leave the average unchanged.
+    """
+    out = np.full(len(x), np.nan)
+    finite = np.flatnonzero(np.isfinite(x))
+    if len(finite) < n:
+        return out
+    alpha = 1.0 / n
+    seed_pos = finite[n - 1]  # the bar where n finite values are available
+    prev = float(np.mean(x[finite[:n]]))
+    out[seed_pos] = prev
+    for i in range(seed_pos + 1, len(x)):
+        if np.isfinite(x[i]):
+            prev = alpha * x[i] + (1 - alpha) * prev
+            out[i] = prev
+    return out
+
+
+class RmaAtrBands(Strategy):
+    """Port of the Pine script "RMA ATR Bands" (SchizoQuant), as a long/flat strategy.
+
+    Bands: MA = RMA(source, `ma_length`), with source = high by default.
+      upper = MA + ATR(`atr_length`) * upper_mult,  lower = MA - ATR(`atr_length`) * lower_mult,
+      ATR = RMA of the true range.
+    Trend latch (as in the script): close above the upper band sets trend to +1 (long), close below
+    the lower band sets trend to -1 (short). Between signals the trend holds its last value.
+    Long while trend == +1, flat otherwise. The script's short signal is the exit, and the engine trades the
+    next open. Every value uses only bars up to its own close.
+    """
+
+    name = "rma_atr_bands"
+
+    def __init__(
+        self,
+        source: str = "high",
+        ma_length: int = 14,
+        atr_length: int = 13,
+        upper_mult: float = 0.4,
+        lower_mult: float = 1.6,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("rma_atr_bands source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        ma_length, atr_length = int(ma_length), int(atr_length)
+        if ma_length < 1 or atr_length < 1:
+            raise ValueError("rma_atr_bands needs ma_length and atr_length >= 1")
+        if float(upper_mult) < 0 or float(lower_mult) < 0:
+            raise ValueError("rma_atr_bands needs non-negative ATR multipliers")
+        self.source = source
+        self.ma_length = ma_length
+        self.atr_length = atr_length
+        self.upper_mult = float(upper_mult)
+        self.lower_mult = float(lower_mult)
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "ma_length": self.ma_length,
+            "atr_length": self.atr_length,
+            "upper_mult": self.upper_mult,
+            "lower_mult": self.lower_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def bands(self, bars: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+        """Return (ma, upper, lower) as arrays aligned with bars."""
+        h, lo, c = (bars[k].astype(float) for k in ("high", "low", "close"))
+        pc = c.shift(1)
+        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)  # first bar: high - low
+        ma = _rma(self._source(bars).to_numpy(), self.ma_length)
+        atr = _rma(tr.to_numpy(), self.atr_length)
+        upper = ma + atr * self.upper_mult
+        lower = ma - atr * self.lower_mult
+        return (
+            pd.Series(ma, index=bars.index),
+            pd.Series(upper, index=bars.index),
+            pd.Series(lower, index=bars.index),
+        )
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        _, upper, lower = self.bands(bars)
+        close = bars["close"].astype(float).to_numpy()
+        up = upper.to_numpy()
+        dn = lower.to_numpy()
+
+        out = np.zeros(len(close), dtype=int)
+        trend = 0
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period keeps the trend at 0 (flat).
+            if close[i] > up[i]:
+                trend = 1
+            if close[i] < dn[i]:
+                trend = -1
+            out[i] = int(trend == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -568,6 +678,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         PriceActionBreakout,
         HigherHighStructure,
         ChampionDailySetup,
+        RmaAtrBands,
     )
 }
 

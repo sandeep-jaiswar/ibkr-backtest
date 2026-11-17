@@ -115,3 +115,49 @@ def test_profit_factor_is_gross_profit_over_gross_loss():
     assert m["profit_factor"] == pytest.approx(0.50 / 0.10)
     assert m["win_rate"] == pytest.approx(2 / 3)
     assert math.isnan(compute_metrics(equity, trades.iloc[:0], position)["profit_factor"])
+
+
+def test_rma_matches_pine_definition():
+    """Pine ta.rma: seeded with the SMA of the first n values, then alpha = 1/n recursion."""
+    import numpy as np
+
+    from ibbt.strategies import _rma
+
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    out = _rma(x, 3)
+    assert np.isnan(out[:2]).all()
+    assert out[2] == pytest.approx(2.0)  # mean of 1, 2, 3
+    assert out[3] == pytest.approx(2.0 + (4.0 - 2.0) / 3)
+    assert out[5] == pytest.approx(out[4] + (6.0 - out[4]) / 3)
+
+
+def test_rma_atr_bands_trend_latch():
+    """Close above the upper band latches long; close below the lower band latches flat; in between holds."""
+    import numpy as np
+
+    from ibbt.strategies import RmaAtrBands
+
+    n = 60
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.full(30, 100.0), np.linspace(100, 130, 10), np.linspace(130, 110, 10), np.full(10, 80.0)]
+    bars = pd.DataFrame(
+        {"open": close, "high": close + 1.0, "low": close - 1.0, "close": close, "volume": 1.0}, index=idx
+    )
+    strat = RmaAtrBands(ma_length=5, atr_length=5, upper_mult=0.4, lower_mult=1.6)
+    sig = strat.signal(bars)
+    _, upper, lower = strat.bands(bars)
+
+    assert sig.iloc[:10].sum() == 0  # warm-up stays flat
+    first_long = int(np.argmax(close > upper.to_numpy()))
+    assert sig.iloc[first_long] == 1
+    assert sig.iloc[-1] == 0  # the last 10 bars sit below the lower band, so the trend is short
+    assert sig.iloc[-1] == 0 and sig.iloc[-5] == 0
+
+
+def test_rma_atr_bands_rejects_bad_params():
+    from ibbt.strategies import RmaAtrBands
+
+    with pytest.raises(ValueError):
+        RmaAtrBands(source="volume")
+    with pytest.raises(ValueError):
+        RmaAtrBands(ma_length=0)
