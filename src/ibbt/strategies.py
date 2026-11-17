@@ -1097,6 +1097,153 @@ class AdaptiveEhlersPercentile(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class VolatilityAdaptiveTrend(Strategy):
+    """Port of the Pine script "Volatility Adaptive Filtered Trend" (SchizoQuant), as a long/flat strategy.
+
+    Adaptive smoothing: atr = Wilder ATR(vol_len); change = |src - src[vol_len]|;
+    factors = atr / SMA(atr, norm_len) and change / SMA(change, norm_len) (1 when the baseline is 0);
+    normalized = clamp((atr_factor + change_factor) / 2 / 2, 0, 1); sc = min_sc + (max_sc - min_sc) * normalized.
+    adaptive_t = adaptive_t[1] + sc * (src - adaptive_t[1]), re-seeded from src when the previous value is NaN.
+    emaT = EMA(adaptive_t, ema_len). Ehlers filter on emaT over filter_len bars with momentum_len spacing, weighted
+    by |a[i] - a[i + momentum_len]|, falling back to SMA(emaT, filter_len) when the weights sum to 0.
+    Volatility = population stdev of simple returns over band_vol_len bars, taken one bar late, as in the script.
+    Upper = trend + upper_mult * volatility * trend; lower = trend - lower_mult * volatility * trend.
+    Regime latch (starts flat): close > upper sets +1 (long); close < lower sets -1 (flat).
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    """
+
+    name = "volatility_adaptive_trend"
+
+    def __init__(
+        self,
+        source: str = "hlc3",
+        vol_len: int = 15,
+        norm_len: int = 30,
+        min_sc: float = 0.084,
+        max_sc: float = 0.330,
+        ema_len: int = 5,
+        filter_len: int = 9,
+        momentum_len: int = 2,
+        band_vol_len: int = 22,
+        upper_mult: float = 2.0,
+        lower_mult: float = 2.0,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("volatility_adaptive_trend source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.vol_len = int(vol_len)
+        self.norm_len = int(norm_len)
+        self.min_sc = float(min_sc)
+        self.max_sc = float(max_sc)
+        self.ema_len = int(ema_len)
+        self.filter_len = int(filter_len)
+        self.momentum_len = int(momentum_len)
+        self.band_vol_len = int(band_vol_len)
+        self.upper_mult = float(upper_mult)
+        self.lower_mult = float(lower_mult)
+        if self.vol_len < 2 or self.norm_len < 5 or self.ema_len < 1 or self.band_vol_len < 2:
+            raise ValueError("volatility_adaptive_trend: vol_len >= 2, norm_len >= 5, ema_len >= 1, band_vol_len >= 2")
+        if self.filter_len < 2 or self.momentum_len < 1:
+            raise ValueError("volatility_adaptive_trend: filter_len >= 2 and momentum_len >= 1")
+        if not 0.001 <= self.min_sc <= 1 or not 0.001 <= self.max_sc <= 1:
+            raise ValueError("volatility_adaptive_trend smoothing limits must be in [0.001, 1]")
+        if self.upper_mult < 0.1 or self.lower_mult < 0.1:
+            raise ValueError("volatility_adaptive_trend multipliers must be >= 0.1")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "vol_len": self.vol_len,
+            "norm_len": self.norm_len,
+            "min_sc": self.min_sc,
+            "max_sc": self.max_sc,
+            "ema_len": self.ema_len,
+            "filter_len": self.filter_len,
+            "momentum_len": self.momentum_len,
+            "band_vol_len": self.band_vol_len,
+            "upper_mult": self.upper_mult,
+            "lower_mult": self.lower_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (trend, upper, lower) arrays aligned with bars."""
+        h, lo, c = (bars[k].astype(float) for k in ("high", "low", "close"))
+        src_s = self._source(bars)
+        src = src_s.to_numpy()
+
+        pc = c.shift(1)
+        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
+        atr = _rma(tr.to_numpy(), self.vol_len)
+        change = np.abs(src - src_s.shift(self.vol_len).to_numpy())
+        atr_base = pd.Series(atr).rolling(self.norm_len).mean().to_numpy()
+        change_base = pd.Series(change).rolling(self.norm_len).mean().to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # Pine: baseline != 0 ? x / baseline : 1. A NaN baseline is != 0, so it gives NaN.
+            atr_f = np.where(atr_base != 0.0, atr / atr_base, 1.0)
+            chg_f = np.where(change_base != 0.0, change / change_base, 1.0)
+            combined = (atr_f + chg_f) * 0.5
+            normalized = np.maximum(0.0, np.minimum(1.0, combined / 2.0))  # NaN propagates, as math.min/max do
+        sc = self.min_sc + (self.max_sc - self.min_sc) * normalized
+
+        adaptive = np.full(len(src), np.nan)
+        prev = np.nan
+        for t in range(len(src)):
+            cur = src[t] if np.isnan(prev) else prev + sc[t] * (src[t] - prev)
+            adaptive[t] = cur
+            prev = cur
+
+        ema_t = _ema(adaptive, self.ema_len)
+
+        num = np.zeros(len(ema_t))
+        den = np.zeros(len(ema_t))
+        for i in range(self.filter_len):
+            cur_s = _shift(ema_t, i)
+            ref_s = _shift(ema_t, i + self.momentum_len)
+            valid = np.isfinite(cur_s) & np.isfinite(ref_s)
+            coef = np.where(valid, np.abs(cur_s - ref_s), 0.0)
+            num += np.where(valid, coef * np.where(valid, cur_s, 0.0), 0.0)
+            den += coef
+        fallback = pd.Series(ema_t).rolling(self.filter_len).mean().to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            trend = np.where(den > 0.0, num / den, fallback)
+
+        prev_c = _shift(src, 1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ret = np.where(prev_c != 0.0, (src - prev_c) / prev_c, 0.0)
+        vol = pd.Series(ret).rolling(self.band_vol_len).std(ddof=0).shift(1).to_numpy()
+
+        upper = trend + self.upper_mult * vol * trend
+        lower = trend - self.lower_mult * vol * trend
+        return trend, upper, lower
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        _, upper, lower = self.bands(bars)
+        close = bars["close"].astype(float).to_numpy()
+
+        out = np.zeros(len(close), dtype=int)
+        regime = 0  # `var int SQ = 0`
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if close[i] > upper[i]:
+                regime = 1
+            elif close[i] < lower[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1114,6 +1261,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         DualMaSdOscillator,
         DoubleSmoothedMadTrend,
         AdaptiveEhlersPercentile,
+        VolatilityAdaptiveTrend,
     )
 }
 

@@ -316,3 +316,41 @@ def test_adaptive_ehlers_percentile_rejects_bad_params():
         AdaptiveEhlersPercentile(ma_min=40, ma_max=30)
     with pytest.raises(ValueError):
         AdaptiveEhlersPercentile(percentile_level=100)
+
+
+def test_volatility_adaptive_trend_follows_breakouts():
+    """Starts flat, goes long on a breakout above the volatility band, and goes flat on a breakdown."""
+    import numpy as np
+    from ibbt.strategies import VolatilityAdaptiveTrend
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = VolatilityAdaptiveTrend().signal(bars)
+    assert sig.iloc[:20].sum() == 0  # bands are still NaN during warm-up
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_volatility_adaptive_trend_constant_price_has_no_trend_error():
+    """With a constant price the trend equals the price, volatility is zero, and the bands collapse onto it."""
+    import numpy as np
+    from ibbt.strategies import VolatilityAdaptiveTrend
+
+    idx = pd.bdate_range("2020-01-01", periods=120)
+    bars = pd.DataFrame({"open": 50.0, "high": 50.0, "low": 50.0, "close": 50.0, "volume": 1.0}, index=idx)
+    trend, upper, lower = VolatilityAdaptiveTrend().bands(bars)
+    valid = ~np.isnan(trend[-20:])
+    assert np.allclose(trend[-20:][valid], 50.0)
+    assert np.allclose(upper[-20:][valid], 50.0)
+    assert VolatilityAdaptiveTrend().signal(bars).sum() == 0  # not above a band equal to the price
+
+
+def test_volatility_adaptive_trend_rejects_bad_params():
+    from ibbt.strategies import VolatilityAdaptiveTrend
+
+    with pytest.raises(ValueError):
+        VolatilityAdaptiveTrend(min_sc=0.0)
+    with pytest.raises(ValueError):
+        VolatilityAdaptiveTrend(filter_len=1)
