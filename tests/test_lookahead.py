@@ -24,6 +24,7 @@ CONFIGS = {
     "price_action_breakout_support": {"breakout_lookback": 20, "max_risk": 0.10, "leg": "both"},
     "higher_high_structure": {"lookback": 20, "trail_bars": 5, "trend": 200},
     "champion_daily_setup": {},
+    "dual_ma_sd_oscillator": {"source": "close", "fast_len": 1, "slow_len": 30, "smooth_len": 1, "upper_sd_len": 25, "lower_sd_len": 25},
     "projected_crossover": {"source": "close", "fast_len": 10, "slow_len": 30, "smooth_len": 5},
     "rma_atr_bands": {"source": "high", "ma_length": 14, "atr_length": 13, "upper_mult": 0.4, "lower_mult": 1.6},
 }

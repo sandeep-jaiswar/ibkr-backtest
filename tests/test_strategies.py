@@ -205,3 +205,44 @@ def test_projected_crossover_rejects_bad_params():
         ProjectedCrossover(fast_len=1)
     with pytest.raises(ValueError):
         ProjectedCrossover(source="volume")
+
+
+def test_dual_ma_sd_oscillator_uses_population_stdev():
+    """Pine ta.stdev is the population standard deviation (ddof=0), and a length-1 EMA is the source itself."""
+    import numpy as np
+    from ibbt.strategies import DualMaSdOscillator
+
+    n = 60
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = 100 + np.sin(np.arange(n) / 3.0) * 5
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    strat = DualMaSdOscillator(slow_len=5, upper_sd_len=10, lower_sd_len=10)
+    osc, upper, lower = strat.oscillator(bars)
+    # The spread with fast_len 1 is close minus its EMA(5); check the band against a hand-computed population stdev.
+    window = osc.iloc[-10:].to_numpy()
+    assert upper.iloc[-1] == pytest.approx(window.std(ddof=0))
+    assert lower.iloc[-1] == pytest.approx(-window.std(ddof=0))
+    assert upper.iloc[:10].isna().all()  # warm-up is NaN
+
+
+def test_dual_ma_sd_oscillator_latches_on_band_breaks():
+    import numpy as np
+    from ibbt.strategies import DualMaSdOscillator
+
+    n = 200
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 160, 100), np.linspace(160, 90, 100)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = DualMaSdOscillator().signal(bars)
+    assert sig.iloc[:30].sum() == 0
+    assert sig.iloc[90] == 1  # strong rise: oscillator breaks above its upper band
+    assert sig.iloc[-1] == 0  # strong fall: oscillator breaks below the lower band
+
+
+def test_dual_ma_sd_oscillator_rejects_bad_params():
+    from ibbt.strategies import DualMaSdOscillator
+
+    with pytest.raises(ValueError):
+        DualMaSdOscillator(upper_sd_len=0)
+    with pytest.raises(ValueError):
+        DualMaSdOscillator(source="volume")

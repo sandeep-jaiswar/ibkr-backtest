@@ -752,6 +752,85 @@ class ProjectedCrossover(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class DualMaSdOscillator(Strategy):
+    """Port of the Pine script "Dual MA SD Oscillator" (SchizoQuant), as a long/flat strategy.
+
+    spread = EMA(src, fast_len) - EMA(src, slow_len); osc = EMA(spread, smooth_len).
+    Upper band = stdev(osc, upper_sd_len); lower band = -stdev(osc, lower_sd_len). stdev is the population
+    standard deviation, as in Pine's `ta.stdev`.
+    Trend latch (as in the script): osc > upper band sets the trend to +1 (long); osc < lower band sets it to -1.
+    Between signals the trend holds its last value. Long while the trend is +1, flat otherwise.
+    The short signal is the exit. The engine trades the next open. Every value uses only bars up to its own close.
+    """
+
+    name = "dual_ma_sd_oscillator"
+
+    def __init__(
+        self,
+        source: str = "close",
+        fast_len: int = 1,
+        slow_len: int = 30,
+        smooth_len: int = 1,
+        upper_sd_len: int = 25,
+        lower_sd_len: int = 25,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("dual_ma_sd_oscillator source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        lengths = [int(fast_len), int(slow_len), int(smooth_len), int(upper_sd_len), int(lower_sd_len)]
+        if min(lengths) < 1:
+            raise ValueError("dual_ma_sd_oscillator needs every length >= 1")
+        self.source = source
+        self.fast_len, self.slow_len, self.smooth_len = lengths[0], lengths[1], lengths[2]
+        self.upper_sd_len, self.lower_sd_len = lengths[3], lengths[4]
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "fast_len": self.fast_len,
+            "slow_len": self.slow_len,
+            "smooth_len": self.smooth_len,
+            "upper_sd_len": self.upper_sd_len,
+            "lower_sd_len": self.lower_sd_len,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def oscillator(self, bars: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+        """Return (osc, upper, lower) aligned with bars."""
+        src = self._source(bars).to_numpy()
+        spread = _ema(src, self.fast_len) - _ema(src, self.slow_len)
+        osc = _ema(spread, self.smooth_len)
+        osc_s = pd.Series(osc)
+        upper = osc_s.rolling(self.upper_sd_len).std(ddof=0).to_numpy()
+        lower = -osc_s.rolling(self.lower_sd_len).std(ddof=0).to_numpy()
+        idx = bars.index
+        return pd.Series(osc, index=idx), pd.Series(upper, index=idx), pd.Series(lower, index=idx)
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        osc, upper, lower = (x.to_numpy() for x in self.oscillator(bars))
+
+        out = np.zeros(len(osc), dtype=int)
+        trend = 0
+        for i in range(len(osc)):
+            # NaN comparisons are False, so the warm-up period keeps the trend at 0 (flat).
+            if osc[i] > upper[i]:
+                trend = 1
+            if osc[i] < lower[i]:
+                trend = -1
+            out[i] = int(trend == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -766,6 +845,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         ChampionDailySetup,
         RmaAtrBands,
         ProjectedCrossover,
+        DualMaSdOscillator,
     )
 }
 
