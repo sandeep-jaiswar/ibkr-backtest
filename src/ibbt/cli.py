@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import re
 import asyncio
 import itertools
 import sys
 from datetime import date, timedelta
 from typing import Any
 
+import duckdb
 import mlflow
 import pandas as pd
 
@@ -97,18 +99,79 @@ async def _backfill(
     end: date,
     exchange: str,
     currency: str,
-) -> None:
+    concurrency: int = 4,
+) -> dict[str, list]:
+    """Fetch symbols with up to `concurrency` requests in flight on one IB connection.
+
+    Writes are idempotent (upsert on the (symbol, ts) key), so re-running never duplicates rows.
+    A failing symbol is recorded and skipped. If the connection drops, nothing new is started,
+    in-flight symbols are recorded as interrupted, and ConnectionError is raised; re-running
+    resumes because covered ranges are skipped.
+    """
+    summary: dict[str, list] = {"stored": [], "covered": [], "empty": [], "failed": [], "interrupted": []}
+    gate = asyncio.Semaphore(concurrency)
     async with ib_source.connect(settings) as ib:
-        for symbol in symbols:
-            gaps = ib_source.missing_ranges(store.coverage(symbol), start, end)
-            if not gaps:
-                print(f"{symbol}: already covered {start}..{end}")
-                continue
-            for gap_start, gap_end in gaps:
-                bars = await ib_source.fetch_daily_bars(ib, symbol, gap_start, gap_end, exchange, currency)
-                written = store.upsert_bars(symbol, bars)
-                store.log_fetch(symbol=symbol, start=gap_start, end=gap_end, rows=written, source="IB")
-                print(f"{symbol}: stored {written} bars for {gap_start}..{gap_end}")
+
+        async def worker(symbol: str) -> None:
+            async with gate:
+                if not ib.isConnected():
+                    summary["interrupted"].append(symbol)
+                    return
+                try:
+                    gaps = ib_source.missing_ranges(store.coverage(symbol), start, end)
+                    if not gaps:
+                        summary["covered"].append(symbol)
+                        return
+                    written_total = 0
+                    for gap_start, gap_end in gaps:
+                        bars = await ib_source.fetch_daily_bars(ib, symbol, gap_start, gap_end, exchange, currency)
+                        written = store.upsert_bars(symbol, bars)
+                        store.log_fetch(symbol=symbol, start=gap_start, end=gap_end, rows=written, source="IB")
+                        written_total += written
+                    summary["stored" if written_total else "empty"].append(symbol)
+                    print(f"{symbol}: stored {written_total} bars", flush=True)
+                except Exception as exc:
+                    if not ib.isConnected():
+                        summary["interrupted"].append(symbol)
+                        return
+                    summary["failed"].append((symbol, str(exc)))
+                    print(f"{symbol}: FAILED {type(exc).__name__}: {exc}", flush=True)
+
+        await asyncio.gather(*(worker(s) for s in symbols))
+    if summary["interrupted"]:
+        raise ConnectionError(
+            f"IB connection lost; {len(summary['interrupted'])} symbols not finished. Re-run to resume."
+        )
+    return summary
+
+
+def cmd_ingest_universe(args: argparse.Namespace) -> int:
+    import pandas as pd
+
+    membership = pd.read_csv(args.membership)
+    indices = args.indices or sorted(membership["index"].unique())
+    subset = membership[membership["index"].isin(indices)]
+    # IB writes share classes with a space (BRK.B -> "BRK B").
+    # Keep only plain US-style tickers; cash, futures and foreign-listing rows are not stock symbols.
+    tickers = {str(t).strip() for t in subset["ticker"]}
+    symbols = sorted(t.replace(".", " ") for t in tickers if re.fullmatch(r"[A-Z][A-Z.]{0,5}", t))
+    print(f"ingesting {len(symbols)} unique symbols from {', '.join(indices)}", flush=True)
+    settings = Settings.from_env()
+    with Store(settings.duckdb_path) as store:
+        summary = asyncio.run(
+            _backfill(
+                settings, store, symbols, args.start, args.end, args.exchange, args.currency, args.concurrency
+            )
+        )
+    failed = pd.DataFrame(summary["failed"], columns=["symbol", "error"])
+    failed.to_csv(args.failures_out, index=False)
+    print(
+        f"done: stored={len(summary['stored'])} covered={len(summary['covered'])} "
+        f"empty={len(summary['empty'])} failed={len(summary['failed'])} "
+        f"(failures -> {args.failures_out})",
+        flush=True,
+    )
+    return 0
 
 
 def _print_metrics(metrics: dict[str, float]) -> None:
@@ -143,6 +206,26 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     _print_metrics(out.metrics)
     if out.mlflow_run_id:
         print(f"mlflow run {out.mlflow_run_id}")
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    from ibbt.search import log_search, passes, run_search
+
+    settings = Settings.from_env()
+    cfg = BacktestConfig()
+    results = run_search(str(settings.duckdb_path), args.split, symbols=args.symbols, cfg=cfg)
+    results["pass_is"] = passes(results, "is")
+    results["pass_oos"] = passes(results, "oos")
+    n = len(args.symbols) if args.symbols else int(
+        duckdb.connect(str(settings.duckdb_path), read_only=True).sql("select count(distinct symbol) from bars").fetchone()[0]
+    )
+    run_id = log_search(results, settings=settings, split=args.split, n_symbols=n, cfg=cfg, experiment_note=args.note)
+    print(results.sort_values("is_profit_factor", ascending=False).head(10).to_string(index=False))
+    print(
+        f"configs passing IS: {int(results.pass_is.sum())}, OOS: {int(results.pass_oos.sum())}, "
+        f"both: {int((results.pass_is & results.pass_oos).sum())}; MLflow parent run {run_id}"
+    )
     return 0
 
 
@@ -252,10 +335,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--currency", default="USD")
     p.set_defaults(func=cmd_fetch)
 
+    p = sub.add_parser("ingest-universe", help="fetch daily bars for every ticker in the membership file")
+    p.add_argument("--membership", default="data/universe/membership.csv")
+    p.add_argument("--indices", nargs="*", help="subset of SP500 NDX DJIA RUT2000 (default: all)")
+    p.add_argument("--start", type=date.fromisoformat, default=date(2015, 1, 1))
+    p.add_argument("--end", type=date.fromisoformat, default=date.today() - timedelta(days=1))
+    p.add_argument("--exchange", default="SMART")
+    p.add_argument("--currency", default="USD")
+    p.add_argument("--failures-out", default="data/universe/fetch_failures.csv")
+    p.add_argument("--concurrency", type=int, default=4, help="symbols in flight at once (IB pacing applies)")
+    p.set_defaults(func=cmd_ingest_universe)
+
     p = sub.add_parser("backtest", help="run one backtest on stored bars")
     _add_backtest_args(p)
     p.add_argument("--param", action="append", metavar="KEY=VALUE", help="strategy parameter, repeatable")
     p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("search", help="strategy search across the universe, logged to MLflow")
+    p.add_argument("--split", type=date.fromisoformat, default=date(2021, 1, 1), help="out-of-sample start")
+    p.add_argument("--symbols", nargs="*", help="default: every symbol in the database")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("sweep", help="grid-search strategy parameters; each run is an MLflow child")
     _add_backtest_args(p)

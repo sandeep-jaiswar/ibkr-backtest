@@ -95,7 +95,67 @@ class DonchianBreakout(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
-REGISTRY: dict[str, type[Strategy]] = {s.name: s for s in (BuyAndHold, SmaCrossover, DonchianBreakout)}
+class RsiPullback(Strategy):
+    """Connors-style RSI(2) pullback in an uptrend.
+
+    Enter long when the close is above its `trend` SMA and RSI(`rsi_period`) is below `entry_rsi`.
+    Exit when the close rises above its `exit_sma` SMA or RSI exceeds `exit_rsi`.
+    Stateful, so it walks the bars in a loop. RSI uses simple averages of gains and losses.
+    """
+
+    name = "rsi_pullback"
+
+    def __init__(
+        self,
+        rsi_period: int = 2,
+        entry_rsi: float = 10.0,
+        exit_rsi: float = 70.0,
+        trend: int = 200,
+        exit_sma: int = 5,
+    ):
+        rsi_period, trend, exit_sma = int(rsi_period), int(trend), int(exit_sma)
+        if rsi_period < 1 or trend < 2 or exit_sma < 1:
+            raise ValueError("rsi_pullback needs rsi_period, trend and exit_sma to be positive")
+        self.rsi_period = rsi_period
+        self.entry_rsi = float(entry_rsi)
+        self.exit_rsi = float(exit_rsi)
+        self.trend = trend
+        self.exit_sma = exit_sma
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "rsi_period": self.rsi_period,
+            "entry_rsi": self.entry_rsi,
+            "exit_rsi": self.exit_rsi,
+            "trend": self.trend,
+            "exit_sma": self.exit_sma,
+        }
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].astype(float)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(self.rsi_period).mean()
+        loss = (-delta.clip(upper=0)).rolling(self.rsi_period).mean()
+        rsi = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(100.0).to_numpy()
+        trend_ma = close.rolling(self.trend).mean().to_numpy()
+        exit_ma = close.rolling(self.exit_sma).mean().to_numpy()
+        c = close.to_numpy()
+
+        out = np.zeros(len(c), dtype=int)
+        holding = 0
+        for i in range(len(c)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if holding == 0 and c[i] > trend_ma[i] and rsi[i] < self.entry_rsi:
+                holding = 1
+            elif holding == 1 and (c[i] > exit_ma[i] or rsi[i] > self.exit_rsi):
+                holding = 0
+            out[i] = holding
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
+REGISTRY: dict[str, type[Strategy]] = {
+    s.name: s for s in (BuyAndHold, SmaCrossover, DonchianBreakout, RsiPullback)
+}
 
 
 def make_strategy(name: str, params: dict[str, Any] | None = None) -> Strategy:

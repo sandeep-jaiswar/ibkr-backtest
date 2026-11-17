@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta
@@ -53,14 +54,21 @@ def _is_pacing_error(exc: BaseException) -> bool:
     return getattr(exc, "code", None) == PACING_ERROR_CODE or "pacing" in str(exc).lower()
 
 
-async def _request_chunk(ib: IB, contract: Any, end_str: str) -> Any:
+def duration_str(days: int) -> str:
+    """IB duration for a daily-bar request covering `days` calendar days (one request per symbol)."""
+    if days <= 365:
+        return "1 Y"
+    return f"{math.ceil(days / 365.25)} Y"
+
+
+async def _request_chunk(ib: IB, contract: Any, end_str: str, duration: str = "1 Y") -> Any:
     """One historical-data request, retried on errors up to MAX_ATTEMPTS times."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return await ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime=end_str,
-                durationStr="1 Y",
+                durationStr=duration,
                 barSizeSetting="1 day",
                 whatToShow="TRADES",
                 useRTH=True,
@@ -124,7 +132,7 @@ async def fetch_daily_bars(
     cursor = end + timedelta(days=1)  # IB's endDateTime is exclusive at midnight
     while cursor > start:
         end_str = datetime.combine(cursor, time(0)).strftime("%Y%m%d %H:%M:%S")
-        raw = await _request_chunk(ib, contract, end_str)
+        raw = await _request_chunk(ib, contract, end_str, duration_str((cursor - start).days))
         if not raw:
             break
         chunk = util.df(raw)
@@ -135,7 +143,8 @@ async def fetch_daily_bars(
         if earliest >= cursor:  # no backward progress; stop rather than loop forever
             break
         cursor = earliest
-        await asyncio.sleep(PACING_SECONDS)
+        if cursor > start:  # pace only before another request, not after the last one
+            await asyncio.sleep(PACING_SECONDS)
 
     columns = ["ts", "open", "high", "low", "close", "volume"]
     if not frames:

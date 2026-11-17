@@ -32,6 +32,9 @@ def compute_metrics(
     round_trips = len(closed)
     win_rate = (closed["pnl_pct"] > 0).mean() if round_trips else math.nan
     avg_trade_pnl = closed["pnl_pct"].mean() if round_trips else math.nan
+    gross_profit = closed.loc[closed["pnl_pct"] > 0, "pnl_pct"].sum() if round_trips else 0.0
+    gross_loss = -closed.loc[closed["pnl_pct"] <= 0, "pnl_pct"].sum() if round_trips else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (math.inf if gross_profit > 0 else math.nan)
 
     return {
         "final_equity": float(equity.iloc[-1]),
@@ -45,4 +48,5 @@ def compute_metrics(
         "round_trips": float(round_trips),
         "win_rate": float(win_rate),
         "avg_trade_pnl_pct": float(avg_trade_pnl),
+        "profit_factor": float(profit_factor),
     }

@@ -95,3 +95,23 @@ def test_donchian_rejects_exit_not_below_lookback():
 
 def test_donchian_is_registered():
     assert isinstance(make_strategy("donchian_breakout", {"lookback": 10, "exit_lookback": 5}), DonchianBreakout)
+
+
+def test_profit_factor_is_gross_profit_over_gross_loss():
+    import math
+
+    from ibbt.metrics import compute_metrics
+
+    idx = pd.bdate_range("2020-01-01", periods=6)
+    equity = pd.Series([100.0, 110, 105, 115, 112, 120], index=idx)
+    trades = pd.DataFrame(
+        {
+            "entry_date": idx[:3], "entry_price": [1.0] * 3, "exit_date": idx[1:4],
+            "exit_price": [1.0] * 3, "pnl_pct": [0.20, -0.10, 0.30], "open": [False] * 3,
+        }
+    )
+    position = pd.Series([1, 1, 1, 1, 0, 0], index=idx)
+    m = compute_metrics(equity, trades, position)
+    assert m["profit_factor"] == pytest.approx(0.50 / 0.10)
+    assert m["win_rate"] == pytest.approx(2 / 3)
+    assert math.isnan(compute_metrics(equity, trades.iloc[:0], position)["profit_factor"])

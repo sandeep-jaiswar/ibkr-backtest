@@ -134,3 +134,24 @@ def test_on_chunk_receives_each_raw_chunk(monkeypatch):
     assert len(seen) == len(ib.requests)
     assert all(isinstance(c, pd.DataFrame) and not c.empty for c in seen)
     assert len(df) <= sum(len(c) for c in seen)  # trimming never adds rows
+
+
+@pytest.mark.parametrize(
+    "days, expected",
+    [(1, "1 Y"), (365, "1 Y"), (366, "2 Y"), (4383, "12 Y"), (4400, "13 Y")],
+)
+def test_duration_str_covers_span_in_one_request(days, expected):
+    assert ib_source.duration_str(days) == expected
+
+
+def test_single_request_covers_full_range(monkeypatch):
+    monkeypatch.setattr(ib_source, "PACING_SECONDS", 0)
+
+    class LongIB(FakeIB):
+        async def reqHistoricalDataAsync(self, contract, endDateTime, durationStr, **kwargs):
+            self.requests.append((endDateTime, durationStr))
+            return await super().reqHistoricalDataAsync(contract, endDateTime, **kwargs)
+
+    ib = LongIB()
+    asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2015, 1, 1), date(2026, 11, 15)))
+    assert ib.requests[0][1] == "12 Y"
