@@ -479,3 +479,26 @@ def test_adaptive_supersmoother_rejects_bad_params():
         AdaptiveSuperSmoother(smooth_len=2)
     with pytest.raises(ValueError):
         AdaptiveSuperSmoother(ma_min=60, ma_max=50)
+
+
+def test_adx_lifecycle_trail_regimes():
+    """Starts bullish, follows a rally, and flips flat once a sustained selloff with DI dominance breaks the trail."""
+    import numpy as np
+    from ibbt.strategies import AdxLifecycleTrail
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = AdxLifecycleTrail().signal(bars)
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adx_lifecycle_trail_rejects_bad_params():
+    from ibbt.strategies import AdxLifecycleTrail
+
+    with pytest.raises(ValueError):
+        AdxLifecycleTrail(short_len=12, medium_len=5)
+    with pytest.raises(ValueError):
+        AdxLifecycleTrail(dominance_level=0.9)

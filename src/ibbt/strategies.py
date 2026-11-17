@@ -1841,6 +1841,181 @@ class AdaptiveSuperSmoother(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class AdxLifecycleTrail(Strategy):
+    """Port of the Pine script "ADX Lifecycle Trail" (SchizoQuant), as a long/flat strategy.
+
+    DMI: +DM/-DM from the bar-to-bar high and low moves; +DI/-DI = 100 * RMA(DM, dmi_len) / max(RMA(TR), mintick).
+    Dominance = (+DI - -DI) / (+DI + -DI), 0 when the DI sum is not positive (so NaN warm-up gives 0).
+    ADX = RMA(DX, dmi_len), DX = 100 * |+DI - -DI| / (+DI + -DI).
+    Lifecycle = clamp((ADX - ADX[lifecycle_len]) / lifecycle_scale, -1, 1).
+    Defence levels: three completed horizons (short, medium, long) of the prior bars' lows (highs). When the lifecycle
+    is positive, the bullish defence moves from the medium low towards the long low; when negative, towards the short low.
+    The bearish defence is the mirror image, on highs.
+    Trail (starts bullish: dominance is 0 on the first bar): bullish regime trail = max(previous trail, bullish defence);
+    bearish = min(previous trail, bearish defence). Flip to bullish when src > trail and dominance > dominance_level;
+    flip to bearish when src < trail and dominance < -dominance_level. A flip resets the trail to src -/+ reset distance,
+    where reset = max(ATR(atr_len), mintick) * reset_mult.
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    `mintick` stands in for Pine's syminfo.mintick.
+    """
+
+    name = "adx_lifecycle_trail"
+
+    def __init__(
+        self,
+        source: str = "close",
+        dmi_len: int = 17,
+        dominance_level: float = 0.10,
+        lifecycle_len: int = 4,
+        lifecycle_scale: float = 8.0,
+        short_len: int = 5,
+        medium_len: int = 12,
+        long_len: int = 24,
+        atr_len: int = 14,
+        reset_mult: float = 2.5,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adx_lifecycle_trail source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.dmi_len = int(dmi_len)
+        self.dominance_level = float(dominance_level)
+        self.lifecycle_len = int(lifecycle_len)
+        self.lifecycle_scale = float(lifecycle_scale)
+        self.short_len = int(short_len)
+        self.medium_len = int(medium_len)
+        self.long_len = int(long_len)
+        self.atr_len = int(atr_len)
+        self.reset_mult = float(reset_mult)
+        self.mintick = float(mintick)
+        if self.dmi_len < 2 or self.lifecycle_len < 1 or self.atr_len < 1:
+            raise ValueError("adx_lifecycle_trail needs dmi_len >= 2, lifecycle_len >= 1, atr_len >= 1")
+        if not 0.0 <= self.dominance_level <= 0.8 or self.lifecycle_scale < 0.5:
+            raise ValueError("adx_lifecycle_trail: dominance_level in [0, 0.8], lifecycle_scale >= 0.5")
+        if not 2 <= self.short_len < self.medium_len < self.long_len:
+            raise ValueError("adx_lifecycle_trail needs 2 <= short_len < medium_len < long_len")
+        if self.reset_mult < 0.1 or self.mintick <= 0:
+            raise ValueError("adx_lifecycle_trail needs reset_mult >= 0.1 and mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "dmi_len": self.dmi_len,
+            "dominance_level": self.dominance_level,
+            "lifecycle_len": self.lifecycle_len,
+            "lifecycle_scale": self.lifecycle_scale,
+            "short_len": self.short_len,
+            "medium_len": self.medium_len,
+            "long_len": self.long_len,
+            "atr_len": self.atr_len,
+            "reset_mult": self.reset_mult,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
+        h = bars["high"].astype(float)
+        lo = bars["low"].astype(float)
+        c = bars["close"].astype(float)
+        hv, lv = h.to_numpy(), lo.to_numpy()
+
+        up_move = (h - h.shift(1).fillna(h)).to_numpy()
+        down_move = (lo.shift(1).fillna(lo) - lo).to_numpy()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
+
+        pc = c.shift(1)
+        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1).to_numpy()
+        tr[0] = hv[0] - lv[0]
+        smoothed_tr = np.maximum(_rma(tr, self.dmi_len), self.mintick)
+        plus_di = 100.0 * _rma(plus_dm, self.dmi_len) / smoothed_tr
+        minus_di = 100.0 * _rma(minus_dm, self.dmi_len) / smoothed_tr
+
+        di_sum = plus_di + minus_di
+        with np.errstate(invalid="ignore", divide="ignore"):
+            dominance = np.where(di_sum > 0.0, (plus_di - minus_di) / di_sum, 0.0)
+            dx = np.where(di_sum > 0.0, 100.0 * np.abs(plus_di - minus_di) / di_sum, 0.0)
+        adx = _rma(dx, self.dmi_len)
+
+        prev_adx = _shift(adx, self.lifecycle_len)
+        adx_change = adx - np.where(np.isnan(prev_adx), adx, prev_adx)
+        lifecycle = np.maximum(-1.0, np.minimum(1.0, adx_change / self.lifecycle_scale))
+
+        def prior_extreme(arr: np.ndarray, length: int, fn: str) -> np.ndarray:
+            """ta.lowest/highest(arr, length)[1], with nz fallback to the current bar."""
+            roll = pd.Series(arr).rolling(length)
+            prior = (roll.min() if fn == "min" else roll.max()).shift(1).to_numpy()
+            return np.where(np.isnan(prior), arr, prior)
+
+        short_low = prior_extreme(lv, self.short_len, "min")
+        medium_low = prior_extreme(lv, self.medium_len, "min")
+        long_low = prior_extreme(lv, self.long_len, "min")
+        short_high = prior_extreme(hv, self.short_len, "max")
+        medium_high = prior_extreme(hv, self.medium_len, "max")
+        long_high = prior_extreme(hv, self.long_len, "max")
+
+        pos = lifecycle >= 0.0
+        bull_def = np.where(pos, medium_low + lifecycle * (long_low - medium_low), medium_low + (-lifecycle) * (short_low - medium_low))
+        bear_def = np.where(pos, medium_high + lifecycle * (long_high - medium_high), medium_high + (-lifecycle) * (short_high - medium_high))
+
+        atr = np.maximum(_rma(tr, self.atr_len), self.mintick)
+        return {
+            "dominance": dominance,
+            "bull_def": bull_def,
+            "bear_def": bear_def,
+            "reset": atr * self.reset_mult,
+            "close": c.to_numpy(),
+            "high": hv,
+            "low": lv,
+        }
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        lv = self._levels(bars)
+        src = self._source(bars).to_numpy()
+        dom, bull_def, bear_def, reset = lv["dominance"], lv["bull_def"], lv["bear_def"], lv["reset"]
+        n = len(src)
+
+        out = np.zeros(n, dtype=int)
+        sq = 1 if dom[0] >= 0.0 else -1  # `var int SQ = dominance >= 0 ? 1 : -1`
+        trail = np.nan  # `var float trendTrail = na`
+        for t in range(n):
+            prev_sq = sq
+            if trail == trail:
+                prev_trail = trail
+            else:
+                prev_trail = src[t] - reset[t] if prev_sq == 1 else src[t] + reset[t]
+
+            if prev_sq == 1:
+                trail_t = _nmax(prev_trail, bull_def[t])
+            else:
+                trail_t = _nmin(prev_trail, bear_def[t])
+            trail = trail_t
+
+            is_long = prev_sq == -1 and src[t] > trail_t and dom[t] > self.dominance_level
+            is_short = prev_sq == 1 and src[t] < trail_t and dom[t] < -self.dominance_level
+            if is_long:
+                sq = 1
+                trail = src[t] - reset[t]
+            elif is_short:
+                sq = -1
+                trail = src[t] + reset[t]
+            else:
+                sq = prev_sq
+            out[t] = int(sq == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1863,6 +2038,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         AdaptivePersistenceTrail,
         AdaptiveVidya,
         AdaptiveSuperSmoother,
+        AdxLifecycleTrail,
     )
 }
 
