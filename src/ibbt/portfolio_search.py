@@ -204,7 +204,7 @@ def load_universe(db_path: str | Path, symbols: list[str] | None = None) -> Univ
         | ((prev > 0) & ((df["close"] / prev > 3) | (df["close"] / prev < 1 / 3)))
     )
     first_bad = df.loc[corrupt].groupby("symbol")["ts"].min()
-    cutoff = df["symbol"].map(first_bad)
+    cutoff = pd.to_datetime(df["symbol"].map(first_bad.to_dict()))
     df = df[cutoff.isna() | (df["ts"] < cutoff)]
     bad_symbols = set(first_bad.index)
     # No minimum-history filter over the full span: that would let future bar counts decide inclusion.

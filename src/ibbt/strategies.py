@@ -1863,7 +1863,7 @@ class AdxLifecycleTrail(Strategy):
         minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
 
         pc = c.shift(1)
-        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1).to_numpy()
+        tr = np.array(pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1), dtype=float)
         tr[0] = hv[0] - lv[0]
         smoothed_tr = np.maximum(_rma(tr, self.dmi_len), self.mintick)
         plus_di = 100.0 * _rma(plus_dm, self.dmi_len) / smoothed_tr
@@ -2062,7 +2062,7 @@ class KaufmanAdaptiveChannel(Strategy):
             prev = cur
 
         pc = c.shift(1)
-        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1).to_numpy()
+        tr = np.array(pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1), dtype=float)
         tr[0] = hv[0] - lv[0]
         atr_raw = _rma(tr, self.atr_len)
         atr = np.maximum(np.where(np.isnan(atr_raw), tr, atr_raw), self.mintick)
