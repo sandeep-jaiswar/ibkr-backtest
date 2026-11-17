@@ -3,6 +3,10 @@
 Walk-forward windows are half-open in calendar time: a window [a, b) holds the bars with a <= ts < b.
 The slices returned by `walk_forward_splits` are closed label slices (`bars.loc[s]`) that cover
 exactly the bars in those windows, so consecutive windows never share a bar.
+
+Signals are computed on history up to the end of the window they serve, so indicator warm-up can
+use bars from before the window starts. Nothing after a window's last bar is ever used for that
+window's signal. The backtest itself runs on the window's bars only and starts flat on its first bar.
 """
 
 from __future__ import annotations
@@ -60,7 +64,7 @@ def walk_forward_splits(
         raise ValueError("n_folds, train_years and test_years must all be at least 1")
 
     # Exclusive end at the next midnight, so the last bar falls inside the final test window.
-    end = index[-1].normalize() + pd.Timedelta(days=1)
+    end = index[-1].normalize() + pd.Timedelta(1, unit="D")
     bounds = [end - pd.DateOffset(years=test_years * (n_folds - k)) for k in range(n_folds + 1)]
 
     folds: list[tuple[slice, slice]] = []
@@ -77,18 +81,32 @@ def walk_forward_splits(
     return folds
 
 
+def _window_signal(bars: pd.DataFrame, strategy, window: slice) -> pd.Series:
+    """The strategy's signal over `window`, computed from history up to the window's last bar.
+
+    Bars before the window are visible so indicators can warm up; bars after it never are.
+    """
+    return strategy.signal(bars.loc[: window.stop]).loc[window]
+
+
 def _grid_results(
     bars: pd.DataFrame,
+    window: slice,
     strategy_name: str,
     grid: list[dict],
     cfg: BacktestConfig,
 ) -> pd.DataFrame:
-    """One row per grid entry that runs (entries raising ValueError are skipped), indexed by grid position."""
+    """One row per grid entry that runs (entries raising ValueError are skipped), indexed by grid position.
+
+    Each entry's signal is computed on `bars` up to the end of `window`, then the backtest runs on
+    the window's bars alone.
+    """
     rows: dict[int, dict] = {}
     for pos, params in enumerate(grid):
         try:
             strategy = make_strategy(strategy_name, params)
-            metrics = _evaluate(bars, strategy.signal(bars), cfg)
+            signal = _window_signal(bars, strategy, window)
+            metrics = _evaluate(bars.loc[window], signal, cfg)
         except ValueError:
             continue
         rows[pos] = {**params, **metrics}
@@ -106,9 +124,12 @@ def walk_forward_eval(
 ) -> pd.DataFrame:
     """Pick the best grid entry by train-window Sharpe in each fold, then score it out of sample.
 
-    The strategy is re-run on each window's own bars, so a test window's signal never sees
-    bars outside that window. Returns one row per fold with the chosen params, the train Sharpe
-    and the test-window metrics prefixed with `oos_`.
+    Signals see history before a window (for indicator warm-up) but never bars after that window's
+    last bar. For fitting, each grid entry's train signal is computed on bars up to the train end.
+    For the out-of-sample score, the chosen entry's test signal is computed on bars up to the test
+    end. Each backtest runs on its window's bars only, starting flat on the window's first bar.
+    Returns one row per fold with the chosen params, the train Sharpe and the test-window metrics
+    prefixed with `oos_`.
     """
     if not grid:
         raise ValueError("grid must contain at least one parameter set")
@@ -121,14 +142,15 @@ def walk_forward_eval(
         train_bars = bars.loc[train_slice]
         test_bars = bars.loc[test_slice]
 
-        fits = _grid_results(train_bars, strategy_name, grid, cfg)
+        fits = _grid_results(bars, train_slice, strategy_name, grid, cfg)
         valid = fits.dropna(subset=["sharpe"]) if not fits.empty else fits
         if valid.empty:
             raise ValueError(f"fold {k}: no grid entry produced a finite train Sharpe")
         best_pos = valid["sharpe"].astype(float).idxmax()
         chosen = grid[best_pos]
 
-        oos = _evaluate(test_bars, make_strategy(strategy_name, chosen).signal(test_bars), cfg)
+        oos_signal = _window_signal(bars, make_strategy(strategy_name, chosen), test_slice)
+        oos = _evaluate(test_bars, oos_signal, cfg)
         rows.append(
             {
                 "fold": k,

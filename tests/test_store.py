@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import pandas as pd
@@ -71,3 +72,43 @@ def test_log_fetch_records_request_and_row_count(tmp_path):
         symbol, start, end, n, source, fetched_at = rows[0]
         assert (symbol, start, end, n, source) == ("ABC", date(2022, 1, 3), date(2022, 3, 31), 60, "ib")
         assert fetched_at is not None
+
+
+def test_save_run_stores_strict_json_when_metrics_are_infinite(tmp_path):
+    """profit_factor can be +inf; the stored JSON must still parse with a strict parser."""
+
+    def _reject_constant(name):
+        raise ValueError(f"non-standard JSON constant {name}")
+
+    metrics = {"profit_factor": float("inf"), "sortino": float("-inf"), "sharpe": float("nan"), "total_return": 0.1}
+    with Store(tmp_path / "m.duckdb") as store:
+        store.save_run(
+            run_id="inf1",
+            strategy="test",
+            symbol="ABC",
+            start=date(2022, 1, 3),
+            end=date(2022, 3, 31),
+            params={"fast": 10, "cap": float("inf")},
+            metrics=metrics,
+            mlflow_run_id=None,
+        )
+        raw_metrics, raw_params = store.con.execute(
+            "SELECT metrics, params FROM backtest_runs WHERE run_id = 'inf1'"
+        ).fetchone()
+
+    parsed = json.loads(raw_metrics, parse_constant=_reject_constant)
+    assert parsed == {"profit_factor": None, "sortino": None, "sharpe": None, "total_return": 0.1}
+    assert json.loads(raw_params, parse_constant=_reject_constant) == {"fast": 10, "cap": None}
+
+
+def test_fetched_ranges_returns_every_logged_window_for_the_symbol(tmp_path):
+    with Store(tmp_path / "m.duckdb") as store:
+        store.log_fetch(symbol="ABC", start=date(2010, 1, 1), end=date(2015, 12, 31), rows=0, source="IB")
+        store.log_fetch(symbol="ABC", start=date(2016, 1, 1), end=date(2016, 12, 31), rows=252, source="IB")
+        store.log_fetch(symbol="XYZ", start=date(2000, 1, 1), end=date(2000, 12, 31), rows=10, source="IB")
+
+        assert store.fetched_ranges("ABC") == [
+            (date(2010, 1, 1), date(2015, 12, 31)),
+            (date(2016, 1, 1), date(2016, 12, 31)),
+        ]
+        assert store.fetched_ranges("NOPE") == []

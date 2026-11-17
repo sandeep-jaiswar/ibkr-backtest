@@ -37,6 +37,11 @@ def test_make_strategy_unknown_name():
         make_strategy("does_not_exist")
 
 
+def test_make_strategy_unknown_parameter_names_the_strategy_and_accepted_names():
+    with pytest.raises(ValueError, match=r"sma_crossover.*fastt.*accepted parameters.*'fast'.*'slow'"):
+        make_strategy("sma_crossover", {"fastt": 5})
+
+
 def test_missing_ranges_empty_store_fetches_everything():
     assert missing_ranges(None, date(2020, 1, 1), date(2020, 6, 1)) == [(date(2020, 1, 1), date(2020, 6, 1))]
 
@@ -106,8 +111,12 @@ def test_profit_factor_is_gross_profit_over_gross_loss():
     equity = pd.Series([100.0, 110, 105, 115, 112, 120], index=idx)
     trades = pd.DataFrame(
         {
-            "entry_date": idx[:3], "entry_price": [1.0] * 3, "exit_date": idx[1:4],
-            "exit_price": [1.0] * 3, "pnl_pct": [0.20, -0.10, 0.30], "open": [False] * 3,
+            "entry_date": idx[:3],
+            "entry_price": [1.0] * 3,
+            "exit_date": idx[1:4],
+            "exit_price": [1.0] * 3,
+            "pnl_pct": [0.20, -0.10, 0.30],
+            "open": [False] * 3,
         }
     )
     position = pd.Series([1, 1, 1, 1, 0, 0], index=idx)
@@ -181,6 +190,7 @@ def test_ema_matches_pine_definition():
 def test_projected_crossover_follows_uptrend_and_downtrend():
     """A rising series latches long once MDI and the slow-lag test agree; a falling one latches flat."""
     import numpy as np
+
     from ibbt.strategies import ProjectedCrossover
 
     n = 200
@@ -210,6 +220,7 @@ def test_projected_crossover_rejects_bad_params():
 def test_dual_ma_sd_oscillator_uses_population_stdev():
     """Pine ta.stdev is the population standard deviation (ddof=0), and a length-1 EMA is the source itself."""
     import numpy as np
+
     from ibbt.strategies import DualMaSdOscillator
 
     n = 60
@@ -227,6 +238,7 @@ def test_dual_ma_sd_oscillator_uses_population_stdev():
 
 def test_dual_ma_sd_oscillator_latches_on_band_breaks():
     import numpy as np
+
     from ibbt.strategies import DualMaSdOscillator
 
     n = 200
@@ -251,6 +263,7 @@ def test_dual_ma_sd_oscillator_rejects_bad_params():
 def test_double_smoothed_mad_trend_starts_long_and_latches():
     """The script starts with trend = +1. A falling series latches flat and a rising one latches long."""
     import numpy as np
+
     from ibbt.strategies import DoubleSmoothedMadTrend
 
     n = 200
@@ -266,6 +279,7 @@ def test_double_smoothed_mad_trend_starts_long_and_latches():
 
 def test_double_smoothed_mad_tsi_is_zero_when_denominator_is_zero():
     import numpy as np
+
     from ibbt.strategies import DoubleSmoothedMadTrend
 
     idx = pd.bdate_range("2020-01-01", periods=40)
@@ -286,6 +300,7 @@ def test_double_smoothed_mad_rejects_bad_params():
 
 def test_nearest_rank_percentile_matches_definition():
     import numpy as np
+
     from ibbt.strategies import _percentile_nearest_rank
 
     x = np.array([5.0, 1.0, 4.0, 2.0, 3.0])
@@ -297,6 +312,7 @@ def test_nearest_rank_percentile_matches_definition():
 def test_adaptive_ehlers_percentile_regimes():
     """Starts flat, goes long on a breakout above the percentile band, and goes flat on a breakdown."""
     import numpy as np
+
     from ibbt.strategies import AdaptiveEhlersPercentile
 
     n = 260
@@ -321,6 +337,7 @@ def test_adaptive_ehlers_percentile_rejects_bad_params():
 def test_volatility_adaptive_trend_follows_breakouts():
     """Starts flat, goes long on a breakout above the volatility band, and goes flat on a breakdown."""
     import numpy as np
+
     from ibbt.strategies import VolatilityAdaptiveTrend
 
     n = 260
@@ -336,6 +353,7 @@ def test_volatility_adaptive_trend_follows_breakouts():
 def test_volatility_adaptive_trend_constant_price_has_no_trend_error():
     """With a constant price the trend equals the price, volatility is zero, and the bands collapse onto it."""
     import numpy as np
+
     from ibbt.strategies import VolatilityAdaptiveTrend
 
     idx = pd.bdate_range("2020-01-01", periods=120)
@@ -358,6 +376,7 @@ def test_volatility_adaptive_trend_rejects_bad_params():
 
 def test_mesa_phase_activity_is_bounded_and_flat_on_constant_price():
     import numpy as np
+
     from ibbt.strategies import _mesa_phase_activity
 
     act = _mesa_phase_activity(np.linspace(100, 120, 300), 0.5, 0.05)
@@ -367,6 +386,7 @@ def test_mesa_phase_activity_is_bounded_and_flat_on_constant_price():
 
 def test_mesa_phase_band_trend_breakouts():
     import numpy as np
+
     from ibbt.strategies import MesaPhaseBandTrend
 
     n = 260
@@ -391,6 +411,7 @@ def test_mesa_phase_band_rejects_bad_params():
 def test_adaptive_persistence_trail_regimes():
     """Starts long, follows a rally, and flips flat once a sustained selloff breaks the trail."""
     import numpy as np
+
     from ibbt.strategies import AdaptivePersistenceTrail
 
     n = 260
@@ -414,6 +435,7 @@ def test_adaptive_persistence_trail_rejects_bad_params():
 def test_adaptive_vidya_regimes():
     """Starts bullish, goes long on a rally breakout, and goes flat once a selloff breaks the lower band."""
     import numpy as np
+
     from ibbt.strategies import AdaptiveVidya
 
     n = 260
@@ -427,6 +449,7 @@ def test_adaptive_vidya_regimes():
 
 def test_adaptive_vidya_constant_price_tracks_price():
     import numpy as np
+
     from ibbt.strategies import AdaptiveVidya
 
     idx = pd.bdate_range("2020-01-01", periods=80)
@@ -449,6 +472,7 @@ def test_adaptive_vidya_rejects_bad_params():
 def test_adaptive_supersmoother_regimes():
     """Starts flat, goes long on a sustained rally, and goes flat on a sustained selloff."""
     import numpy as np
+
     from ibbt.strategies import AdaptiveSuperSmoother
 
     n = 260
@@ -463,6 +487,7 @@ def test_adaptive_supersmoother_regimes():
 
 def test_adaptive_supersmoother_constant_price_is_flat():
     import numpy as np
+
     from ibbt.strategies import AdaptiveSuperSmoother
 
     idx = pd.bdate_range("2020-01-01", periods=80)
@@ -484,6 +509,7 @@ def test_adaptive_supersmoother_rejects_bad_params():
 def test_adx_lifecycle_trail_regimes():
     """Starts bullish, follows a rally, and flips flat once a sustained selloff with DI dominance breaks the trail."""
     import numpy as np
+
     from ibbt.strategies import AdxLifecycleTrail
 
     n = 260
@@ -507,6 +533,7 @@ def test_adx_lifecycle_trail_rejects_bad_params():
 def test_kaufman_adaptive_channel_regimes():
     """Starts bullish, follows a rally, and flips flat once a sustained selloff breaks the trail."""
     import numpy as np
+
     from ibbt.strategies import KaufmanAdaptiveChannel
 
     n = 260
@@ -530,6 +557,7 @@ def test_kaufman_adaptive_channel_rejects_bad_params():
 def test_adaptive_breakout_oscillator_regimes():
     """Starts from a flat oscillator (regime long), follows a rally, and flips flat on a sustained selloff."""
     import numpy as np
+
     from ibbt.strategies import AdaptiveBreakoutOscillator
 
     n = 260
@@ -556,6 +584,7 @@ def test_adaptive_breakout_oscillator_rejects_bad_params():
 def test_ehlers_instant_trend_regimes():
     """Starts bullish, follows a rally, and flips flat on a sustained selloff with negative momentum."""
     import numpy as np
+
     from ibbt.strategies import EhlersInstantTrend
 
     n = 260
@@ -569,6 +598,7 @@ def test_ehlers_instant_trend_regimes():
 
 def test_ehlers_instant_trend_seed_during_first_bars():
     import numpy as np
+
     from ibbt.strategies import EhlersInstantTrend
 
     idx = pd.bdate_range("2020-01-01", periods=12)
@@ -589,8 +619,9 @@ def test_ehlers_instant_trend_rejects_bad_params():
 
 
 def test_decycler_hl_breakout_stays_flat_during_warmup_and_follows_trend():
-    """The regime is flat until the 115-bar warm-up is complete, then goes long on a sustained rally and flat on a crash."""
+    """Flat until the 115-bar warm-up is complete, then long on a sustained rally and flat on a crash."""
     import numpy as np
+
     from ibbt.strategies import DecyclerHighLowBreakout
 
     n = 460

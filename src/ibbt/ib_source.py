@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -93,17 +93,42 @@ async def _request_chunk(ib: IB, contract: Any, end_str: str, duration: str = "1
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def missing_ranges(coverage: tuple[date, date] | None, start: date, end: date) -> list[tuple[date, date]]:
-    """Date ranges not yet in the store. Assumes stored data is contiguous."""
-    if coverage is None:
-        return [(start, end)]
-    lo, hi = coverage
+def missing_ranges(
+    coverage: tuple[date, date] | None,
+    start: date,
+    end: date,
+    fetched: Iterable[tuple[date, date]] = (),
+) -> list[tuple[date, date]]:
+    """Sub-ranges of [start, end] not yet covered.
+
+    `coverage` is the stored (first, last) bar date, assumed contiguous. `fetched` holds
+    (start, end) windows that were already requested from IB, including empty ones (IB had
+    no bars there, e.g. before a late IPO), so those windows are not re-requested.
+    Both inputs are inclusive; the result is sorted, non-overlapping and inclusive.
+    """
+    covered: list[tuple[date, date]] = []
+    if coverage is not None:
+        covered.append(coverage)
+    covered.extend(fetched)
+
+    # Clip each covered window to the requested range, drop empties, then merge overlapping or adjacent ones.
+    clipped = sorted((max(a, start), min(b, end)) for a, b in covered if a <= b and a <= end and b >= start)
+    merged: list[tuple[date, date]] = []
+    for a, b in clipped:
+        if merged and a <= merged[-1][1] + timedelta(days=1):
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+
     gaps: list[tuple[date, date]] = []
-    if start < lo:
-        gaps.append((start, min(end, lo - timedelta(days=1))))
-    if end > hi:
-        gaps.append((max(start, hi + timedelta(days=1)), end))
-    return [(a, b) for a, b in gaps if a <= b]
+    cursor = start
+    for a, b in merged:
+        if cursor < a:
+            gaps.append((cursor, a - timedelta(days=1)))
+        cursor = max(cursor, b + timedelta(days=1))
+    if cursor <= end:
+        gaps.append((cursor, end))
+    return gaps
 
 
 async def fetch_daily_bars(
@@ -119,7 +144,9 @@ async def fetch_daily_bars(
 
     Returns a frame with columns: ts, open, high, low, close, volume.
     `on_chunk` receives each raw (untrimmed) chunk as it arrives, so callers can
-    persist progress before the whole range is done.
+    persist progress before the whole range is done. Chunks may extend beyond
+    [start, end]; callers that persist them must filter to the range themselves.
+    The returned frame is already trimmed to [start, end] and sorted by ts.
     """
     raw = await ib.qualifyContractsAsync(Stock(symbol, exchange, currency))
     candidates: list[Any] = list(raw) if isinstance(raw, list) else [raw]

@@ -1,6 +1,7 @@
 import math
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -73,6 +74,14 @@ def test_splits_reject_insufficient_history():
         walk_forward_splits(bars.index, n_folds=3, train_years=9, test_years=1)
 
 
+def _windowed_expected(bars, strategy, window):
+    """Signal over `window` from history up to its end, then the backtest on the window's bars."""
+    window_bars = bars.loc[window]
+    signal = strategy.signal(bars.loc[: window.stop]).loc[window]
+    result = run_backtest(window_bars, signal, CFG)
+    return compute_metrics(result.equity, result.trades, result.position)
+
+
 def test_walk_forward_eval_picks_best_train_sharpe_and_scores_test_only():
     bars = _bars()
     splits = walk_forward_splits(bars.index, 3, 3, 1)
@@ -82,38 +91,77 @@ def test_walk_forward_eval_picks_best_train_sharpe_and_scores_test_only():
     assert (out["train_end"] < out["test_start"]).all()
 
     for k, (train_sl, test_sl) in enumerate(splits):
-        train_bars = bars.loc[train_sl]
         train_sharpes = {}
         for params in GRID[:3]:
-            signal = make_strategy("sma_crossover", params).signal(train_bars)
-            result = run_backtest(train_bars, signal, CFG)
-            train_sharpes[(params["fast"], params["slow"])] = compute_metrics(
-                result.equity, result.trades, result.position
-            )["sharpe"]
+            metrics = _windowed_expected(bars, make_strategy("sma_crossover", params), train_sl)
+            train_sharpes[(params["fast"], params["slow"])] = metrics["sharpe"]
         best = max((sharpe, key) for key, sharpe in train_sharpes.items() if not math.isnan(sharpe))[1]
         assert (int(out.loc[k, "fast"]), int(out.loc[k, "slow"])) == best
 
-        # Out-of-sample metrics equal running the chosen params on the test window alone.
-        test_bars = bars.loc[test_sl]
+        # Out-of-sample metrics: the chosen params' signal over the test window, computed from
+        # history up to the test end, then backtested on the test window's bars.
         chosen = make_strategy("sma_crossover", {"fast": best[0], "slow": best[1]})
-        result = run_backtest(test_bars, chosen.signal(test_bars), CFG)
-        expected = compute_metrics(result.equity, result.trades, result.position)
+        expected = _windowed_expected(bars, chosen, test_sl)
         assert out.loc[k, "oos_total_return"] == pytest.approx(expected["total_return"])
         assert out.loc[k, "oos_sharpe"] == pytest.approx(expected["sharpe"])
 
 
-def test_walk_forward_eval_ignores_bars_after_a_fold_test_window():
-    bars = _bars()
-    out = walk_forward_eval(bars, "sma_crossover", GRID, CFG, 3, 3, 1)
+def _cyclic_bars(n: int = 1300, period: int = 150) -> pd.DataFrame:
+    """Business-day bars with a sine-wave close. Fast/slow SMA crossovers recur every few months."""
+    dates = pd.bdate_range("2019-01-01", periods=n)
+    t = np.arange(n)
+    close = 100 + 20 * np.sin(2 * np.pi * t / period)
+    return pd.DataFrame(
+        {"open": close, "high": close * 1.01, "low": close * 0.99, "close": close, "volume": 1e6},
+        index=pd.DatetimeIndex(dates, name="ts"),
+    )
 
-    # Rescale every bar after fold 0's test window. Fold 0 trains and tests only on earlier bars,
-    # so its row must be unchanged.
+
+def test_warmup_history_lets_slow_strategy_trade_inside_the_test_window():
+    bars = _cyclic_bars()
+    params = {"fast": 50, "slow": 200}
+    out = walk_forward_eval(bars, "sma_crossover", [params], CFG, 1, 3, 1)
+    _, test_sl = walk_forward_splits(bars.index, 1, 3, 1)[0]
+
+    # The 200-bar slow SMA needs warm-up. Computed from the test bars alone (the old behaviour),
+    # the 50/200 crossover produces no trade in this window.
+    test_bars = bars.loc[test_sl]
+    old = run_backtest(test_bars, make_strategy("sma_crossover", params).signal(test_bars), CFG)
+    assert compute_metrics(old.equity, old.trades, old.position)["round_trips"] == 0
+
+    # With history before the window visible, the same window contains a round trip.
+    assert out.loc[0, "oos_round_trips"] >= 1
+
+
+def test_oos_result_ignores_bars_after_the_test_window_end():
+    bars = _cyclic_bars()
+    grid = [{"fast": 50, "slow": 200}]
+    out = walk_forward_eval(bars, "sma_crossover", grid, CFG, 1, 3, 1)
+
+    # Replace every price after the test window with a different series. The fold's signal and
+    # backtest must not see any of it, so the OOS metrics stay identical.
     tampered = bars.copy()
     later = tampered.index > out.loc[0, "test_end"]
-    tampered.loc[later, ["open", "close"]] *= 3
-    tampered_out = walk_forward_eval(tampered, "sma_crossover", GRID, CFG, 3, 3, 1)
+    tampered.loc[later, ["open", "high", "low", "close"]] *= 0.5
+    tampered_out = walk_forward_eval(tampered, "sma_crossover", grid, CFG, 1, 3, 1)
 
-    pd.testing.assert_frame_equal(out.iloc[[0]], tampered_out.iloc[[0]])
+    oos_cols = [c for c in out.columns if c.startswith("oos_")]
+    pd.testing.assert_frame_equal(out[oos_cols], tampered_out[oos_cols])
+
+
+def test_train_fit_ignores_bars_after_the_train_end():
+    bars = _cyclic_bars()
+    out = walk_forward_eval(bars, "sma_crossover", GRID, CFG, 1, 3, 1)
+
+    # Alter only bars inside the test window (after the train end). Fitting must not see them, so
+    # the chosen params and the train Sharpe are unchanged.
+    tampered = bars.copy()
+    inside_test = (tampered.index > out.loc[0, "train_end"]) & (tampered.index <= out.loc[0, "test_end"])
+    tampered.loc[inside_test, ["open", "high", "low", "close"]] *= 3
+    tampered_out = walk_forward_eval(tampered, "sma_crossover", GRID, CFG, 1, 3, 1)
+
+    fit_cols = ["fold", "train_start", "train_end", "fast", "slow", "train_sharpe"]
+    pd.testing.assert_frame_equal(out[fit_cols], tampered_out[fit_cols])
 
 
 def test_walk_forward_eval_skips_invalid_grid_entries():

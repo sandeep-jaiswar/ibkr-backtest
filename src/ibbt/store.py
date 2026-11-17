@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS equity_curves (
 
 
 def _clean(values: dict[str, Any]) -> dict[str, Any]:
-    """Replace NaN with None so the JSON stored in DuckDB is valid."""
-    return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in values.items()}
+    """Replace NaN and +/-inf with None so the JSON stored in DuckDB is valid (JSON has no Infinity token)."""
+    return {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in values.items()}
 
 
 class Store:
@@ -107,6 +107,16 @@ class Store:
             "INSERT INTO fetch_log VALUES (?, ?, ?, ?, ?, ?)",
             [symbol, datetime.now(), start, end, rows, source],
         )
+
+    def fetched_ranges(self, symbol: str) -> list[tuple[date, date]]:
+        """(start, end) of every logged fetch for a symbol. log_fetch runs only after a successful
+        fetch, so each row counts, including rows=0 (IB has no data for that window)."""
+        rows = self.con.execute(
+            "SELECT start_date, end_date FROM fetch_log "
+            "WHERE symbol = ? AND start_date IS NOT NULL AND end_date IS NOT NULL",
+            [symbol],
+        ).fetchall()
+        return [(a, b) for a, b in rows]
 
     def upsert_bars(self, symbol: str, bars: pd.DataFrame) -> int:
         """Insert or replace daily bars. `bars` needs a `ts` column plus BAR_COLUMNS."""
@@ -160,8 +170,8 @@ class Store:
                 symbol,
                 start,
                 end,
-                json.dumps(params, default=str),
-                json.dumps(_clean(metrics), default=str),
+                json.dumps(_clean(params), default=str, allow_nan=False),
+                json.dumps(_clean(metrics), default=str, allow_nan=False),
                 mlflow_run_id,
             ],
         )

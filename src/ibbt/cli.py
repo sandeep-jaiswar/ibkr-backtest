@@ -19,7 +19,7 @@ from ibbt.config import Settings
 from ibbt.engine import BacktestConfig
 from ibbt.portfolio import PortfolioConfig
 from ibbt.runner import run_and_record
-from ibbt.store import Store
+from ibbt.store import BAR_COLUMNS, Store
 from ibbt.strategies import REGISTRY
 from ibbt.synthetic import synthetic_bars
 from ibbt.validation import overfit_warning, walk_forward_eval
@@ -104,6 +104,13 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bars_in_range(chunk: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """Raw IB chunk -> bars with `ts` and BAR_COLUMNS, trimmed to [start, end] (inclusive)."""
+    frame = chunk.assign(ts=pd.to_datetime(chunk["date"])).drop_duplicates("ts")
+    frame = frame[(frame["ts"] >= pd.Timestamp(start)) & (frame["ts"] <= pd.Timestamp(end))]
+    return frame[["ts", *BAR_COLUMNS]]
+
+
 async def _backfill(
     settings: Settings,
     store: Store,
@@ -133,14 +140,22 @@ async def _backfill(
                     return
                 try:
                     key = key_prefix + symbol  # stored key; the IB contract still uses the plain symbol
-                    gaps = ib_source.missing_ranges(store.coverage(key), start, end)
+                    gaps = ib_source.missing_ranges(store.coverage(key), start, end, store.fetched_ranges(key))
                     if not gaps:
                         summary["covered"].append(symbol)
                         return
                     written_total = 0
                     for gap_start, gap_end in gaps:
-                        bars = await ib_source.fetch_daily_bars(ib, symbol, gap_start, gap_end, exchange, currency)
+                        # Each chunk is written as it arrives, so a failure mid-gap keeps what was downloaded.
+                        # Upserts are idempotent, so the final write below only refreshes the same rows.
+                        def persist(chunk: pd.DataFrame, lo: date = gap_start, hi: date = gap_end) -> None:
+                            store.upsert_bars(key, _bars_in_range(chunk, lo, hi))
+
+                        bars = await ib_source.fetch_daily_bars(
+                            ib, symbol, gap_start, gap_end, exchange, currency, on_chunk=persist
+                        )
                         written = store.upsert_bars(key, bars)
+                        # Logged only after the whole gap succeeded; an unlogged gap is simply re-requested.
                         store.log_fetch(symbol=key, start=gap_start, end=gap_end, rows=written, source="IB")
                         written_total += written
                     summary["stored" if written_total else "empty"].append(symbol)
@@ -161,8 +176,6 @@ async def _backfill(
 
 
 def cmd_ingest_universe(args: argparse.Namespace) -> int:
-    import pandas as pd
-
     membership = pd.read_csv(args.membership)
     indices = args.indices or sorted(membership["index"].unique())
     subset = membership[membership["index"].isin(indices)]
@@ -226,7 +239,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     from ibbt.search import log_search, passes, run_search
 
     settings = Settings.from_env()
-    cfg = BacktestConfig()
+    cfg = BacktestConfig(commission_bps=args.commission_bps, slippage_bps=args.slippage_bps)
     results = run_search(str(settings.duckdb_path), args.split, symbols=args.symbols, cfg=cfg)
     results["pass_is"] = passes(results, "is")
     results["pass_oos"] = passes(results, "oos")
@@ -234,8 +247,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         n = len(args.symbols)
     else:
         con = duckdb.connect(str(settings.duckdb_path), read_only=True)
-        n = int(con.execute("select count(distinct symbol) from bars").fetchone()[0])
-        con.close()
+        try:
+            row = con.execute("select count(distinct symbol) from bars").fetchone()
+        finally:
+            con.close()
+        n = int(row[0]) if row else 0
     run_id = log_search(results, settings=settings, split=args.split, n_symbols=n, cfg=cfg, experiment_note=args.note)
     print(results.sort_values("is_profit_factor", ascending=False).head(10).to_string(index=False))
     print(
@@ -374,7 +390,9 @@ def cmd_portfolio_holdout(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     child = args.run_id or pick_best(settings)
     print(f"holdout check on candidate run {child}")
-    metrics = run_holdout(settings.duckdb_path, settings, child_run_id=child, base=_portfolio_base(args))
+    metrics = run_holdout(
+        settings.duckdb_path, settings, child_run_id=child, base=_portfolio_base(args), force=args.force
+    )
     _print_metrics(metrics)
     return 0
 
@@ -427,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", type=date.fromisoformat, default=date(2021, 1, 1), help="out-of-sample start")
     p.add_argument("--symbols", nargs="*", help="default: every symbol in the database")
     p.add_argument("--note", default="")
+    p.add_argument("--commission-bps", type=float, default=5.0)
+    p.add_argument("--slippage-bps", type=float, default=5.0)
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("portfolio-search", help="portfolio-level search (train/valid), logged to MLflow")
@@ -444,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("portfolio-holdout", help="one-time holdout check (2023 onward) on a search candidate")
     _add_portfolio_args(p)
     p.add_argument("--run-id", help="MLflow child run of a search candidate; default: best passing candidate")
+    p.add_argument("--force", action="store_true", help="run the holdout even if it was already run for this candidate")
     p.set_defaults(func=cmd_portfolio_holdout)
 
     p = sub.add_parser("sweep", help="grid-search strategy parameters; each run is an MLflow child")

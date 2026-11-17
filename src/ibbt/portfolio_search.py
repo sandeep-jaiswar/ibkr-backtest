@@ -3,7 +3,8 @@
 Three windows, used in this order:
   * train      2015-01-01 .. 2019-12-31   (candidates are compared and gated here)
   * valid      2020-01-01 .. 2022-12-31   (second gate; same rules as train)
-  * holdout    2023-01-01 .. end          (run once, on one chosen candidate, via `run_holdout`)
+  * holdout    2023-01-01 .. end          (one-time check on one chosen candidate, via `run_holdout`;
+                                            one-time by convention and enforced: a repeat raises unless force=True)
 
 Signals are computed on the full history so indicator warm-up uses real data. Each window is
 then simulated from fresh capital, so no window starts with positions carried over from another.
@@ -16,6 +17,7 @@ MLflow layout (experiment `ibkr-portfolio`):
   * one nested child per candidate (params, metrics for each window, tags: goal_met, candidate_json,
     an equity curve logged as a stepped metric, and the valid-window trade list as an artifact)
   * one run per holdout check, tagged stage=holdout and linked to the candidate it tests
+    (a forced repeat is tagged holdout_repeat=true)
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -45,6 +48,7 @@ from ibbt.portfolio import PortfolioConfig, portfolio_metrics, run_portfolio
 from ibbt.strategies import REGISTRY, make_strategy
 
 EXPERIMENT = "ibkr-portfolio"
+_RUN_ID_RE = re.compile(r"[0-9a-f]{32}")
 WINDOWS: dict[str, tuple[date, date]] = {
     "train": (date(2015, 1, 1), date(2020, 1, 1)),
     "valid": (date(2020, 1, 1), date(2023, 1, 1)),
@@ -336,11 +340,12 @@ def log_round(
     note: str,
     experiment: str = EXPERIMENT,
 ) -> str:
-    """Log one search round: a parent run and a nested child per candidate. Returns the parent run id."""
     """Log one search round with batched writes: one `log_batch` call per run, not one per metric.
 
-    Parent and children are created through MlflowClient, so each run costs a handful of commits
-    instead of one commit per parameter, metric or equity point.
+    A parent run for the round and a nested child per candidate. Parent and children are created through
+    MlflowClient, so each run costs a handful of commits instead of one commit per parameter, metric or
+    equity point. If anything fails mid-round, the open children and the parent are still terminated, the
+    parent with status FAILED. Returns the parent run id.
     """
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = mlflow.MlflowClient()
@@ -359,76 +364,90 @@ def log_round(
             "note": note,
         },
     ).info.run_id
-    round_params = {
-        **base.as_params(),
-        "n_symbols": n_symbols,
-        "excluded_for_quality": excluded_for_quality,
-        "n_candidates": len(evaluated),
-    }
-    round_params.update({f"window_{w}": f"{a}..{b}" for w, (a, b) in WINDOWS.items()})
-    client.log_batch(
-        parent_id,
-        params=[Param(k, str(v)) for k, v in round_params.items()],
-        metrics=[Metric("candidates_passing_goal", float(sum(e["goal_met"] for e in evaluated)), now, 0)],
-    )
-
-    # Heavy artifacts (equity curve, trade list) only for the top 10 by validation PF.
-    top_ids = {id(e) for e in sorted(evaluated, key=_valid_pf_key, reverse=True)[:10]}
-    rows = []
-    for e in evaluated:
-        cand: Candidate = e["candidate"]
-        child_id = client.create_run(
-            exp_id,
-            run_name=cand.name()[:250],
-            tags={
-                MLFLOW_PARENT_RUN_ID: parent_id,
-                "stage": "search",
-                "strategy": cand.strategy,
-                "goal_met": str(e["goal_met"]).lower(),
-                "candidate_json": cand.to_json(),
-                "source_parent_run": parent_id,
-            },
-        ).info.run_id
-        metrics = [Metric(k, v, now, 0) for k, v in _flat_metrics(e["results"]).items()]
-        params = {**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold}
-        if id(e) in top_ids:
-            valid_eq = e["results"]["valid"]["equity"].iloc[::21]
-            metrics += [Metric("valid_equity", float(v), now, step) for step, v in enumerate(valid_eq.to_numpy())]
-        client.log_batch(
-            child_id,
-            metrics=metrics[:1000],
-            params=[Param(k, str(v)) for k, v in params.items()],
-        )
-        if id(e) in top_ids:
-            with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "valid_trades.csv"
-                e["results"]["valid"]["trades"].to_csv(path, index=False)
-                client.log_artifact(child_id, str(path), artifact_path="trades")
-        client.set_terminated(child_id)
-        rows.append(
-            {
-                "run_id": child_id,
-                "candidate": cand.name(),
-                "goal_met": e["goal_met"],
-                **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
-            }
-        )
-
-    leaderboard = pd.DataFrame(rows).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "leaderboard.csv"
-        leaderboard.to_csv(path, index=False)
-        client.log_artifact(parent_id, str(path))
-    if not leaderboard.empty:
-        best = leaderboard.iloc[0]
+    open_children: list[str] = []  # created but not yet terminated
+    status = "FAILED"
+    try:
+        round_params = {
+            **base.as_params(),
+            "n_symbols": n_symbols,
+            "excluded_for_quality": excluded_for_quality,
+            "n_candidates": len(evaluated),
+        }
+        round_params.update({f"window_{w}": f"{a}..{b}" for w, (a, b) in WINDOWS.items()})
         client.log_batch(
             parent_id,
-            metrics=[
-                Metric("best_valid_profit_factor", float(best["valid_profit_factor"]), now, 0),
-                Metric("best_valid_win_rate", float(best["valid_win_rate"]), now, 0),
-            ],
+            params=[Param(k, str(v)) for k, v in round_params.items()],
+            metrics=[Metric("candidates_passing_goal", float(sum(e["goal_met"] for e in evaluated)), now, 0)],
         )
-    client.set_terminated(parent_id)
+
+        # Heavy artifacts (equity curve, trade list) only for the top 10 by validation PF.
+        top_ids = {id(e) for e in sorted(evaluated, key=_valid_pf_key, reverse=True)[:10]}
+        rows = []
+        for e in evaluated:
+            cand: Candidate = e["candidate"]
+            child_id = client.create_run(
+                exp_id,
+                run_name=cand.name()[:250],
+                tags={
+                    MLFLOW_PARENT_RUN_ID: parent_id,
+                    "stage": "search",
+                    "strategy": cand.strategy,
+                    "goal_met": str(e["goal_met"]).lower(),
+                    "candidate_json": cand.to_json(),
+                    "source_parent_run": parent_id,
+                },
+            ).info.run_id
+            open_children.append(child_id)
+            metrics = [Metric(k, v, now, 0) for k, v in _flat_metrics(e["results"]).items()]
+            params = {
+                **cand.params,
+                "stop_pct": cand.stop_pct,
+                "target_pct": cand.target_pct,
+                "max_hold": cand.max_hold,
+            }
+            if id(e) in top_ids:
+                valid_eq = e["results"]["valid"]["equity"].iloc[::21]
+                metrics += [Metric("valid_equity", float(v), now, step) for step, v in enumerate(valid_eq.to_numpy())]
+            client.log_batch(
+                child_id,
+                metrics=metrics[:1000],
+                params=[Param(k, str(v)) for k, v in params.items()],
+            )
+            if id(e) in top_ids:
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "valid_trades.csv"
+                    e["results"]["valid"]["trades"].to_csv(path, index=False)
+                    client.log_artifact(child_id, str(path), artifact_path="trades")
+            client.set_terminated(child_id)
+            open_children.remove(child_id)
+            rows.append(
+                {
+                    "run_id": child_id,
+                    "candidate": cand.name(),
+                    "goal_met": e["goal_met"],
+                    **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
+                }
+            )
+
+        leaderboard = pd.DataFrame(rows).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "leaderboard.csv"
+            leaderboard.to_csv(path, index=False)
+            client.log_artifact(parent_id, str(path))
+        if not leaderboard.empty:
+            best = leaderboard.iloc[0]
+            client.log_batch(
+                parent_id,
+                metrics=[
+                    Metric("best_valid_profit_factor", float(best["valid_profit_factor"]), now, 0),
+                    Metric("best_valid_win_rate", float(best["valid_win_rate"]), now, 0),
+                ],
+            )
+        status = "FINISHED"
+    finally:
+        for child_id in open_children:
+            client.set_terminated(child_id, status="FAILED")
+        client.set_terminated(parent_id, status=status)
     return parent_id
 
 
@@ -471,10 +490,15 @@ def search(
     workers: int | None = None,
     exit_grid: dict[str, list[Any]] = EXIT_GRID,
 ) -> tuple[str, pd.DataFrame]:
+    cands = expand_candidates(strategies=strategies, exit_grid=exit_grid)
+    if not cands:
+        raise ValueError(
+            f"no candidates: none of the requested strategies has a search grid "
+            f"(strategies={strategies}, searchable: {sorted(STRATEGY_GRID)})"
+        )
     global _UNIV, _BASE
     univ = load_universe(db_path, symbols)
     _UNIV, _BASE = univ, base
-    cands = expand_candidates(strategies=strategies, exit_grid=exit_grid)
     groups: dict[tuple, list[Candidate]] = {}
     for cand in cands:
         groups.setdefault((cand.strategy, cand.strategy_params), []).append(cand)
@@ -517,8 +541,16 @@ def run_holdout(
     child_run_id: str,
     base: PortfolioConfig,
     experiment: str = EXPERIMENT,
+    force: bool = False,
 ) -> dict[str, float]:
-    """Run one candidate on the holdout window, once. Logged as a new run linked to the candidate."""
+    """Run one candidate on the holdout window. Logged as a new run linked to the candidate.
+
+    The holdout is one-time by convention, and this is enforced: if a holdout run already exists for
+    `child_run_id` in the experiment, this raises ValueError unless `force=True`. A forced repeat still runs,
+    and its run is tagged holdout_repeat=true so the contamination stays visible.
+    """
+    if not _RUN_ID_RE.fullmatch(child_run_id):
+        raise ValueError(f"not an MLflow run id: {child_run_id!r}")
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = mlflow.MlflowClient()
     source = client.get_run(child_run_id)
@@ -526,11 +558,22 @@ def run_holdout(
     if source.data.tags.get("stage") != "search":
         raise ValueError(f"run {child_run_id} is not a search candidate")
 
+    exp_id = mlflow.set_experiment(experiment).experiment_id
+    prior = client.search_runs(
+        [exp_id],
+        filter_string=f"tags.stage = 'holdout' and tags.source_run_id = '{child_run_id}'",
+        max_results=1,
+    )
+    if prior and not force:
+        raise ValueError(
+            f"holdout was already run for candidate {child_run_id} (holdout run {prior[0].info.run_id}). "
+            "The holdout is one-time; pass force=True (CLI: --force) to run it again anyway."
+        )
+
     univ = load_universe(db_path)
     metrics, result, _ = simulate(univ, cand, base, "holdout", {})
     pooled, _, _ = simulate(univ, cand, base, "holdout", {}, unconstrained=True)
 
-    mlflow.set_experiment(experiment)
     with mlflow.start_run(run_name=f"holdout-{cand.strategy}") as run:
         mlflow.set_tags(
             {
@@ -540,6 +583,8 @@ def run_holdout(
                 "strategy": cand.strategy,
             }
         )
+        if prior:
+            mlflow.set_tag("holdout_repeat", "true")
         mlflow.log_params(
             {**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold}
         )

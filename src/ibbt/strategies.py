@@ -6,6 +6,7 @@ may only use data up to and including bar t's close. The engine trades on the ne
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
@@ -43,6 +44,20 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
     return (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(100.0)
+
+
+def _source_series(bars: pd.DataFrame, source: str) -> pd.Series:
+    """Price series named by `source`: open, high, low, close, hl2, hlc3 or ohlc4, as floats."""
+    o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+    return {
+        "open": o,
+        "high": h,
+        "low": lo,
+        "close": c,
+        "hl2": (h + lo) / 2,
+        "hlc3": (h + lo + c) / 3,
+        "ohlc4": (o + h + lo + c) / 4,
+    }[source]
 
 
 class BuyAndHold(Strategy):
@@ -426,7 +441,7 @@ class HigherHighStructure(Strategy):
         rng = (h - lo).replace(0, np.nan)
         upper_half = (c - lo) >= 0.5 * rng
         c1 = (h > prior_high) & upper_half  # first confirmation, on its own bar
-        c1_prev = c1.shift(1).infer_objects(copy=False).fillna(False).astype(bool)
+        c1_prev = c1.shift(1, fill_value=False).astype(bool)
         h_prev, c_prev = h.shift(1), c.shift(1)
         second = c1_prev & (h > h_prev) & (c > c_prev)  # second higher high after C1, with a higher close
         sma = c.rolling(self.trend).mean()
@@ -631,16 +646,7 @@ class RmaAtrBands(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def bands(self, bars: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
         """Return (ma, upper, lower) as arrays aligned with bars."""
@@ -714,16 +720,7 @@ class ProjectedCrossover(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def mdi(self, bars: pd.DataFrame) -> pd.Series:
         """Market Direction Indicator, aligned with bars."""
@@ -794,16 +791,7 @@ class DualMaSdOscillator(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def oscillator(self, bars: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
         """Return (osc, upper, lower) aligned with bars."""
@@ -880,16 +868,7 @@ class DoubleSmoothedMadTrend(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def tsi(self, bars: pd.DataFrame) -> pd.Series:
         src = self._source(bars)
@@ -982,7 +961,9 @@ class AdaptiveEhlersPercentile(Strategy):
         lower_mult: float = 0.7,
     ):
         if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
-            raise ValueError("adaptive_ehlers_percentile source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+            raise ValueError(
+                "adaptive_ehlers_percentile source must be one of open, high, low, close, hl2, hlc3, ohlc4"
+            )
         self.source = source
         self.ma_min = int(ma_min)
         self.ma_max = int(ma_max)
@@ -996,7 +977,9 @@ class AdaptiveEhlersPercentile(Strategy):
         if self.ma_min < 1 or self.ma_max < 2 or self.ma_min > self.ma_max:
             raise ValueError("adaptive_ehlers_percentile needs 1 <= ma_min <= ma_max, ma_max >= 2")
         if self.vol_len < 2 or self.filter_len < 2 or self.momentum_len < 1 or self.percentile_len < 2:
-            raise ValueError("adaptive_ehlers_percentile: vol_len, filter_len >= 2, momentum_len >= 1, percentile_len >= 2")
+            raise ValueError(
+                "adaptive_ehlers_percentile: vol_len, filter_len >= 2, momentum_len >= 1, percentile_len >= 2"
+            )
         if not 1.0 <= self.percentile_level <= 99.0:
             raise ValueError("adaptive_ehlers_percentile percentile_level must be in [1, 99]")
         if self.upper_mult < 0.1 or self.lower_mult < 0.1:
@@ -1017,16 +1000,7 @@ class AdaptiveEhlersPercentile(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (trend, upper, lower) arrays aligned with bars."""
@@ -1166,16 +1140,7 @@ class VolatilityAdaptiveTrend(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (trend, upper, lower) arrays aligned with bars."""
@@ -1305,8 +1270,8 @@ def _mesa_phase_activity(src: np.ndarray, fast_limit: float, slow_limit: float) 
         q1[t] = q1_t
         i1_t = back(det, 3, 0.0)
         i1[t] = i1_t
-        ji = (0.0962 * i1_t + 0.5769 * back(i1, 2, 0.0) - 0.5769 * back(i1, 4, 0.0) - 0.0962 * back(i1, 6, 0.0)) * pf
-        jq = (0.0962 * q1_t + 0.5769 * back(q1, 2, 0.0) - 0.5769 * back(q1, 4, 0.0) - 0.0962 * back(q1, 6, 0.0)) * pf
+        ji = hilbert(i1, i1_t, pf)
+        jq = hilbert(q1, q1_t, pf)
 
         i2_t = 0.2 * (i1_t - jq) + 0.8 * back(i2, 1, 0.0)
         q2_t = 0.2 * (q1_t + ji) + 0.8 * back(q2, 1, 0.0)
@@ -1389,16 +1354,7 @@ class MesaPhaseBandTrend(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         src_s = self._source(bars)
@@ -1474,7 +1430,9 @@ class AdaptivePersistenceTrail(Strategy):
         mintick: float = 0.01,
     ):
         if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
-            raise ValueError("adaptive_persistence_trail source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+            raise ValueError(
+                "adaptive_persistence_trail source must be one of open, high, low, close, hl2, hlc3, ohlc4"
+            )
         self.source = source
         self.persistence_len = int(persistence_len)
         self.min_acc = float(min_acc)
@@ -1503,16 +1461,7 @@ class AdaptivePersistenceTrail(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def signal(self, bars: pd.DataFrame) -> pd.Series:
         h = bars["high"].astype(float).to_numpy()
@@ -1643,16 +1592,7 @@ class AdaptiveVidya(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (vidya, upper, lower) arrays aligned with bars."""
@@ -1754,16 +1694,7 @@ class AdaptiveSuperSmoother(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def trend(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         """Return (trend, efficiency) arrays aligned with bars."""
@@ -1784,7 +1715,11 @@ class AdaptiveSuperSmoother(Strategy):
         vol_range = s_max - s_min
         with np.errstate(invalid="ignore", divide="ignore"):
             vol_pos = np.where(vol_range > 0.0, np.maximum(0.0, np.minimum(1.0, (sd - s_min) / vol_range)), 0.0)
-            length = np.where(sd <= s_min, self.ma_max, np.where(sd >= s_max, self.ma_min, self.ma_max - (self.ma_max - self.ma_min) * vol_pos))
+            length = np.where(
+                sd <= s_min,
+                self.ma_max,
+                np.where(sd >= s_max, self.ma_min, self.ma_max - (self.ma_max - self.ma_min) * vol_pos),
+            )
             alpha = 2.0 / (length + 1.0)
 
         adaptive = np.full(n, np.nan)
@@ -1848,12 +1783,13 @@ class AdxLifecycleTrail(Strategy):
     Dominance = (+DI - -DI) / (+DI + -DI), 0 when the DI sum is not positive (so NaN warm-up gives 0).
     ADX = RMA(DX, dmi_len), DX = 100 * |+DI - -DI| / (+DI + -DI).
     Lifecycle = clamp((ADX - ADX[lifecycle_len]) / lifecycle_scale, -1, 1).
-    Defence levels: three completed horizons (short, medium, long) of the prior bars' lows (highs). When the lifecycle
-    is positive, the bullish defence moves from the medium low towards the long low; when negative, towards the short low.
-    The bearish defence is the mirror image, on highs.
-    Trail (starts bullish: dominance is 0 on the first bar): bullish regime trail = max(previous trail, bullish defence);
-    bearish = min(previous trail, bearish defence). Flip to bullish when src > trail and dominance > dominance_level;
-    flip to bearish when src < trail and dominance < -dominance_level. A flip resets the trail to src -/+ reset distance,
+    Defence levels: three completed horizons (short, medium, long) of the prior bars' lows (highs).
+    When the lifecycle is positive, the bullish defence moves from the medium low towards the long low;
+    when negative, towards the short low. The bearish defence is the mirror image, on highs.
+    Trail (starts bullish: dominance is 0 on the first bar): bullish regime trail = max(previous trail,
+    bullish defence); bearish = min(previous trail, bearish defence). Flip to bullish when src > trail and
+    dominance > dominance_level; flip to bearish when src < trail and dominance < -dominance_level.
+    A flip resets the trail to src -/+ reset distance,
     where reset = max(ATR(atr_len), mintick) * reset_mult.
     Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
     `mintick` stands in for Pine's syminfo.mintick.
@@ -1913,16 +1849,7 @@ class AdxLifecycleTrail(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
         h = bars["high"].astype(float)
@@ -1966,8 +1893,14 @@ class AdxLifecycleTrail(Strategy):
         long_high = prior_extreme(hv, self.long_len, "max")
 
         pos = lifecycle >= 0.0
-        bull_def = np.where(pos, medium_low + lifecycle * (long_low - medium_low), medium_low + (-lifecycle) * (short_low - medium_low))
-        bear_def = np.where(pos, medium_high + lifecycle * (long_high - medium_high), medium_high + (-lifecycle) * (short_high - medium_high))
+        bull_def = np.where(
+            pos, medium_low + lifecycle * (long_low - medium_low), medium_low + (-lifecycle) * (short_low - medium_low)
+        )
+        bear_def = np.where(
+            pos,
+            medium_high + lifecycle * (long_high - medium_high),
+            medium_high + (-lifecycle) * (short_high - medium_high),
+        )
 
         atr = np.maximum(_rma(tr, self.atr_len), self.mintick)
         return {
@@ -2092,16 +2025,7 @@ class KaufmanAdaptiveChannel(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
         src_s = self._source(bars)
@@ -2231,7 +2155,8 @@ class AdaptiveBreakoutOscillator(Strategy):
     Each channel's breakout pressure is the position of src inside it, mapped to [-1, 1] and saturating outside.
     Compression = ratio / (1 + ratio) where ratio = RMA(width, comp_len) / width, clamped to [0, 1].
     Urgency = 0.5 + 0.5 |pressure|. Weight = min_weight + (1 - min_weight) * compression * urgency.
-    Consensus = weighted mean of the pressures, clamped to [-1, 1]. Dispersion = weighted mean absolute gap to consensus.
+    Consensus = weighted mean of the pressures, clamped to [-1, 1].
+    Dispersion = weighted mean absolute gap to consensus.
     Threshold = clamp(base_threshold + dispersion * adaptation, base_threshold, max_threshold).
     Oscillator = 100 * consensus; the bands are +/- 100 * threshold.
     Regime latch (starts from oscillator >= 0 on the first bar): oscillator > upper sets +1 (long);
@@ -2291,16 +2216,7 @@ class AdaptiveBreakoutOscillator(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def oscillator(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (oscillator, upper, lower) arrays aligned with bars, on the script's 0-100 scale."""
@@ -2322,7 +2238,7 @@ class AdaptiveBreakoutOscillator(Strategy):
             pressures.append(_breakout_pressure(src, hi_c, lo_c, tick))
 
         weights = []
-        for width, pressure in zip(widths, pressures):
+        for width, pressure in zip(widths, pressures, strict=True):
             base = _rma(width, self.comp_len)  # NaN until seeded, as in the script
             with np.errstate(invalid="ignore", divide="ignore"):
                 ratio = np.where(width > 0.0, base / width, 1.0)
@@ -2332,7 +2248,11 @@ class AdaptiveBreakoutOscillator(Strategy):
 
         total = weights[0] + weights[1] + weights[2]
         with np.errstate(invalid="ignore", divide="ignore"):
-            consensus = np.where(total > 0.0, (pressures[0] * weights[0] + pressures[1] * weights[1] + pressures[2] * weights[2]) / total, 0.0)
+            consensus = np.where(
+                total > 0.0,
+                (pressures[0] * weights[0] + pressures[1] * weights[1] + pressures[2] * weights[2]) / total,
+                0.0,
+            )
             consensus = np.maximum(-1.0, np.minimum(1.0, consensus))
             disp = np.where(
                 total > 0.0,
@@ -2376,7 +2296,8 @@ class EhlersInstantTrend(Strategy):
     Trail: bullish = max(previous trail, bullish boundary); bearish = min(previous trail, bearish boundary).
     Bullish flip: prior regime bearish, src > trail, and (momentum > 0 or src > it + ATR * reversal).
     Bearish flip: prior regime bullish, src < trail, and (momentum < 0 or src < it - ATR * reversal).
-    On a flip the trail is set to min(bullish boundary, src - min distance) or max(bearish boundary, src + min distance).
+    On a flip the trail is set to min(bullish boundary, src - min distance)
+    or max(bearish boundary, src + min distance).
     Regime starts bullish when src >= it on the first bar. Long while the regime is +1, flat otherwise.
     The engine trades the next open. Only past and present bars are used. `mintick` stands in for syminfo.mintick.
     """
@@ -2424,16 +2345,7 @@ class EhlersInstantTrend(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
         src_s = self._source(bars)
@@ -2613,16 +2525,7 @@ class DecyclerHighLowBreakout(Strategy):
         }
 
     def _source(self, bars: pd.DataFrame) -> pd.Series:
-        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
-        return {
-            "open": o,
-            "high": h,
-            "low": lo,
-            "close": c,
-            "hl2": (h + lo) / 2,
-            "hlc3": (h + lo + c) / 3,
-            "ohlc4": (o + h + lo + c) / 4,
-        }[self.source]
+        return _source_series(bars, self.source)
 
     def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
         hv = bars["high"].astype(float).to_numpy()
@@ -2723,4 +2626,16 @@ REGISTRY: dict[str, type[Strategy]] = {
 def make_strategy(name: str, params: dict[str, Any] | None = None) -> Strategy:
     if name not in REGISTRY:
         raise KeyError(f"unknown strategy {name!r}; choose from {sorted(REGISTRY)}")
-    return REGISTRY[name](**(params or {}))
+    cls = REGISTRY[name]
+    params = dict(params or {})
+    accepted = list(inspect.signature(cls).parameters)
+    bad = sorted(k for k in params if k not in accepted)
+    if bad:
+        raise ValueError(f"strategy {name!r}: unknown parameter(s) {bad}; accepted parameters: {accepted}")
+    try:
+        inspect.signature(cls).bind(**params)
+    except TypeError as exc:
+        raise ValueError(
+            f"strategy {name!r}: invalid parameters {params}: {exc}; accepted parameters: {accepted}"
+        ) from exc
+    return cls(**params)

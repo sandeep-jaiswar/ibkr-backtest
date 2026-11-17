@@ -35,14 +35,14 @@ def expand_grid(grid: dict[str, dict[str, list[Any]]] = DEFAULT_GRID) -> list[tu
     for name, space in grid.items():
         keys = list(space)
         for values in itertools.product(*(space[k] for k in keys)):
-            params = dict(zip(keys, values))
+            # keys and values come from the same space, so the lengths always match. An empty space
+            # still yields one empty combination from itertools.product, which covers no-parameter strategies.
+            params = dict(zip(keys, values, strict=True))
             try:
                 make_strategy(name, params)
             except ValueError:
                 continue
             configs.append((name, params))
-        if not keys:
-            configs.append((name, {}))
     return configs
 
 
@@ -65,9 +65,7 @@ class Pool:
 
 
 def load_bars(con: duckdb.DuckDBPyConnection, symbol: str) -> pd.DataFrame:
-    df = con.execute(
-        "SELECT ts, open, high, low, close, volume FROM bars WHERE symbol = ? ORDER BY ts", [symbol]
-    ).df()
+    df = con.execute("SELECT ts, open, high, low, close, volume FROM bars WHERE symbol = ? ORDER BY ts", [symbol]).df()
     df["ts"] = pd.to_datetime(df["ts"])
     return df.set_index("ts")
 
@@ -128,9 +126,7 @@ def run_search(
 
 def passes(df: pd.DataFrame, prefix: str, min_pf: float = 2.0, min_win: float = 0.5, min_n: int = 200) -> pd.Series:
     return (
-        (df[f"{prefix}_profit_factor"] >= min_pf)
-        & (df[f"{prefix}_win_rate"] >= min_win)
-        & (df[f"{prefix}_n"] >= min_n)
+        (df[f"{prefix}_profit_factor"] >= min_pf) & (df[f"{prefix}_win_rate"] >= min_win) & (df[f"{prefix}_n"] >= min_n)
     )
 
 

@@ -155,3 +155,59 @@ def test_single_request_covers_full_range(monkeypatch):
     ib = LongIB()
     asyncio.run(ib_source.fetch_daily_bars(ib, "AAPL", date(2015, 1, 1), date(2026, 11, 15)))
     assert ib.requests[0][1] == "12 Y"
+
+
+D = date  # short alias used by the missing_ranges tests
+
+
+def test_missing_ranges_no_coverage_requests_whole_range():
+    assert ib_source.missing_ranges(None, D(2020, 1, 1), D(2020, 3, 31)) == [(D(2020, 1, 1), D(2020, 3, 31))]
+
+
+def test_missing_ranges_full_coverage_requests_nothing():
+    assert ib_source.missing_ranges((D(2019, 1, 1), D(2021, 12, 31)), D(2020, 1, 1), D(2020, 6, 30)) == []
+
+
+def test_missing_ranges_late_ipo_window_is_not_rerequested():
+    """IB returned no bars before the first trade, so that empty window is logged as fetched."""
+    coverage = (D(2019, 6, 3), D(2020, 6, 30))  # listed June 2019
+    fetched = [(D(2018, 1, 1), D(2019, 6, 2))]  # the pre-IPO window came back empty
+    assert ib_source.missing_ranges(coverage, D(2018, 1, 1), D(2020, 6, 30), fetched) == []
+
+
+def test_missing_ranges_without_fetch_log_re_requests_late_ipo_window():
+    """Same symbol without fetched ranges: the pre-IPO window is (wrongly) requested again."""
+    coverage = (D(2019, 6, 3), D(2020, 6, 30))
+    assert ib_source.missing_ranges(coverage, D(2018, 1, 1), D(2020, 6, 30)) == [(D(2018, 1, 1), D(2019, 6, 2))]
+
+
+def test_missing_ranges_gaps_on_both_sides():
+    coverage = (D(2020, 3, 2), D(2020, 9, 30))
+    assert ib_source.missing_ranges(coverage, D(2020, 1, 1), D(2020, 12, 31)) == [
+        (D(2020, 1, 1), D(2020, 3, 1)),
+        (D(2020, 10, 1), D(2020, 12, 31)),
+    ]
+
+
+def test_missing_ranges_overlapping_fetched_ranges_are_merged():
+    fetched = [(D(2018, 1, 1), D(2018, 6, 30)), (D(2018, 3, 1), D(2018, 12, 31)), (D(2017, 1, 1), D(2017, 1, 31))]
+    gaps = ib_source.missing_ranges(None, D(2018, 1, 1), D(2019, 1, 31), fetched)
+    assert gaps == [(D(2019, 1, 1), D(2019, 1, 31))]
+
+
+def test_missing_ranges_adjacent_windows_leave_no_gap_between_them():
+    fetched = [(D(2018, 1, 1), D(2018, 6, 30)), (D(2018, 7, 1), D(2018, 12, 31))]
+    assert ib_source.missing_ranges(None, D(2018, 1, 1), D(2018, 12, 31), fetched) == []
+
+
+def test_missing_ranges_unfetched_hole_before_coverage_is_reported():
+    """Only the part of the window that was never fetched or stored is a gap."""
+    coverage = (D(2020, 1, 2), D(2020, 12, 31))
+    fetched = [(D(2019, 1, 1), D(2019, 12, 31))]
+    assert ib_source.missing_ranges(coverage, D(2019, 1, 1), D(2020, 12, 31), fetched) == [
+        (D(2020, 1, 1), D(2020, 1, 1))
+    ]
+    assert ib_source.missing_ranges(coverage, D(2018, 1, 1), D(2020, 12, 31), fetched) == [
+        (D(2018, 1, 1), D(2018, 12, 31)),
+        (D(2020, 1, 1), D(2020, 1, 1)),
+    ]
