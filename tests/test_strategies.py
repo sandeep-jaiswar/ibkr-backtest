@@ -386,3 +386,26 @@ def test_mesa_phase_band_rejects_bad_params():
         MesaPhaseBandTrend(fast_limit=0.0)
     with pytest.raises(ValueError):
         MesaPhaseBandTrend(trend_len=1)
+
+
+def test_adaptive_persistence_trail_regimes():
+    """Starts long, follows a rally, and flips flat once a sustained selloff breaks the trail."""
+    import numpy as np
+    from ibbt.strategies import AdaptivePersistenceTrail
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = AdaptivePersistenceTrail().signal(bars)
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adaptive_persistence_trail_rejects_bad_params():
+    from ibbt.strategies import AdaptivePersistenceTrail
+
+    with pytest.raises(ValueError):
+        AdaptivePersistenceTrail(persistence_len=1)
+    with pytest.raises(ValueError):
+        AdaptivePersistenceTrail(max_acc=1.5)

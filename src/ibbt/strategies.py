@@ -1432,6 +1432,164 @@ class MesaPhaseBandTrend(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+def _nmax(a: float, b: float) -> float:
+    """Pine math.max: NaN propagates."""
+    return float("nan") if (a != a or b != b) else max(a, b)
+
+
+def _nmin(a: float, b: float) -> float:
+    """Pine math.min: NaN propagates."""
+    return float("nan") if (a != a or b != b) else min(a, b)
+
+
+class AdaptivePersistenceTrail(Strategy):
+    """Port of the Pine script "Adaptive Persistence Trail" (SchizoQuant), as a long/flat strategy.
+
+    Persistence: over the last `persistence_len` bars, sum the up-moves (bullish travel) and down-moves (bearish
+    travel) of the source, with Pine's nz fallback to the current bar.
+    persistence = (bull - bear) / (bull + bear), clamped to [-1, 1]; clarity = |persistence|.
+    Acceleration = min_acc + clarity * (max_acc - min_acc).
+    Reset distance = max(ATR(atr_len), mintick) * reset_mult.
+    Recent low/high = lowest low / highest high over `protection_len` bars, including the current bar.
+    Regime state (as in the script; it starts bullish because persistence is 0 on the first bar):
+      * bullish: extreme = max(extreme, high); trail = max(trail, min(trail + acc * (extreme - trail), recent low));
+        long to short when src < trail;
+      * bearish: the mirror image, with min(extreme, low) and max(..., recent high); short to long when src > trail.
+      * a flip resets the extreme (high or low) and places the trail reset_distance away from src.
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    `mintick` stands in for Pine's syminfo.mintick, which is not available outside TradingView.
+    """
+
+    name = "adaptive_persistence_trail"
+
+    def __init__(
+        self,
+        source: str = "close",
+        persistence_len: int = 20,
+        min_acc: float = 0.5,
+        max_acc: float = 1.0,
+        protection_len: int = 21,
+        atr_len: int = 14,
+        reset_mult: float = 2.0,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adaptive_persistence_trail source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.persistence_len = int(persistence_len)
+        self.min_acc = float(min_acc)
+        self.max_acc = float(max_acc)
+        self.protection_len = int(protection_len)
+        self.atr_len = int(atr_len)
+        self.reset_mult = float(reset_mult)
+        self.mintick = float(mintick)
+        if self.persistence_len < 2 or self.protection_len < 1 or self.atr_len < 1:
+            raise ValueError("adaptive_persistence_trail needs persistence_len >= 2, protection_len >= 1, atr_len >= 1")
+        if not 0 < self.min_acc <= 1 or not 0 < self.max_acc <= 1:
+            raise ValueError("adaptive_persistence_trail accelerations must be in (0, 1]")
+        if self.reset_mult < 0.1 or self.mintick <= 0:
+            raise ValueError("adaptive_persistence_trail needs reset_mult >= 0.1 and mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "persistence_len": self.persistence_len,
+            "min_acc": self.min_acc,
+            "max_acc": self.max_acc,
+            "protection_len": self.protection_len,
+            "atr_len": self.atr_len,
+            "reset_mult": self.reset_mult,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        h = bars["high"].astype(float).to_numpy()
+        lo = bars["low"].astype(float).to_numpy()
+        c = bars["close"].astype(float)
+        src_s = self._source(bars)
+        s = src_s.to_numpy()
+        n = len(s)
+
+        def filled(k: int) -> np.ndarray:
+            """src[t - k], with Pine's nz(src[k], src): the current bar's source where that value is NaN."""
+            arr = _shift(s, k)
+            return np.where(np.isnan(arr), s, arr)
+
+        bull = np.zeros(n)
+        bear = np.zeros(n)
+        for i in range(self.persistence_len):
+            pc = filled(i) - filled(i + 1)
+            bull += np.where(pc > 0.0, pc, 0.0)
+            bear += np.where(pc < 0.0, -pc, 0.0)
+        total = bull + bear
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pers = np.where(total > 0.0, (bull - bear) / total, 0.0)
+        pers = np.maximum(-1.0, np.minimum(1.0, pers))
+        clarity = np.abs(pers)
+        lo_acc, up_acc = min(self.min_acc, self.max_acc), max(self.min_acc, self.max_acc)
+        acc = lo_acc + clarity * (up_acc - lo_acc)
+
+        pc_close = _shift(c.to_numpy(), 1)
+        tr = np.nanmax(np.vstack([h - lo, np.abs(h - pc_close), np.abs(lo - pc_close)]), axis=0)
+        tr[0] = h[0] - lo[0]  # no previous close on the first bar
+        atr = np.maximum(_rma(tr, self.atr_len), self.mintick)
+        reset = atr * self.reset_mult
+
+        recent_low = pd.Series(lo).rolling(self.protection_len).min().to_numpy()
+        recent_high = pd.Series(h).rolling(self.protection_len).max().to_numpy()
+
+        out = np.zeros(n, dtype=int)
+        sq = 1 if pers[0] >= 0.0 else -1  # `var int SQ = persistence >= 0 ? 1 : -1`
+        extreme = s[0]  # `var float regimeExtreme = src`
+        trail = np.nan  # `var float trendTrail = na`
+        for t in range(n):
+            prev_sq = sq
+            prev_ext = extreme if extreme == extreme else s[t]
+            if trail == trail:
+                prev_trail = trail
+            else:
+                prev_trail = s[t] - reset[t] if prev_sq == 1 else s[t] + reset[t]
+
+            if prev_sq == 1:
+                ext_t = _nmax(prev_ext, h[t])
+                accel = prev_trail + acc[t] * (ext_t - prev_trail)
+                protected = _nmin(accel, recent_low[t])
+                trail_t = _nmax(prev_trail, protected)
+            else:
+                ext_t = _nmin(prev_ext, lo[t])
+                accel = prev_trail + acc[t] * (ext_t - prev_trail)
+                protected = _nmax(accel, recent_high[t])
+                trail_t = _nmin(prev_trail, protected)
+            extreme, trail = ext_t, trail_t
+
+            is_long = prev_sq == -1 and s[t] > trail_t  # NaN comparisons are false
+            is_short = prev_sq == 1 and s[t] < trail_t
+            if is_long:
+                sq = 1
+                extreme = h[t]
+                trail = s[t] - reset[t]
+            elif is_short:
+                sq = -1
+                extreme = lo[t]
+                trail = s[t] + reset[t]
+            else:
+                sq = prev_sq
+            out[t] = int(sq == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1451,6 +1609,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         AdaptiveEhlersPercentile,
         VolatilityAdaptiveTrend,
         MesaPhaseBandTrend,
+        AdaptivePersistenceTrail,
     )
 }
 
