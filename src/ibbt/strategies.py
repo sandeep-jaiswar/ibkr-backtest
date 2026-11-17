@@ -831,6 +831,272 @@ class DualMaSdOscillator(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class DoubleSmoothedMadTrend(Strategy):
+    """Port of the Pine script "Double-Smoothed Momentum MAD Trend" (SchizoQuant), as a long/flat strategy.
+
+    momentum = src - src[momentum_len]. tsi = 100 * EMA(EMA(momentum, smooth1), smooth2)
+                                             / EMA(EMA(|momentum|, smooth1), smooth2)  (0 when the denominator is 0).
+    basis = SMA(tsi, mad_len); madValue = SMA(|tsi - basis|, mad_len) (mean absolute deviation, not stdev).
+    Upper threshold = mad_mult * madValue, lower = -mad_mult * madValue.
+    Trend latch (as in the script): tsi > upper sets the trend to +1 (long); tsi < lower sets it to -1 (short).
+    The script starts with trend = +1 (`var int SQ = 1`), so the strategy is long from its first bar until the
+    first short signal. This port keeps that initial state. The signal line is only a plot and is not used.
+    Long while the trend is +1, flat otherwise. The engine trades the next open.
+    Every value uses only bars up to its own close.
+    """
+
+    name = "double_smoothed_mad"
+
+    def __init__(
+        self,
+        source: str = "close",
+        momentum_len: int = 1,
+        smooth1: int = 1,
+        smooth2: int = 20,
+        mad_len: int = 29,
+        mad_mult: float = 1.0,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("double_smoothed_mad source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.momentum_len = int(momentum_len)
+        self.smooth1 = int(smooth1)
+        self.smooth2 = int(smooth2)
+        self.mad_len = int(mad_len)
+        self.mad_mult = float(mad_mult)
+        if min(self.momentum_len, self.smooth1, self.smooth2) < 1 or self.mad_len < 2:
+            raise ValueError("double_smoothed_mad needs momentum_len, smooth1, smooth2 >= 1 and mad_len >= 2")
+        if self.mad_mult < 0.1:
+            raise ValueError("double_smoothed_mad needs mad_mult >= 0.1")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "momentum_len": self.momentum_len,
+            "smooth1": self.smooth1,
+            "smooth2": self.smooth2,
+            "mad_len": self.mad_len,
+            "mad_mult": self.mad_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def tsi(self, bars: pd.DataFrame) -> pd.Series:
+        src = self._source(bars)
+        momentum = (src - src.shift(self.momentum_len)).to_numpy()
+        num = _ema(_ema(momentum, self.smooth1), self.smooth2)
+        den = _ema(_ema(np.abs(momentum), self.smooth1), self.smooth2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # Pine: den != 0 ? 100 * num / den : 0. A NaN denominator (warm-up) stays NaN.
+            tsi = np.where(den != 0.0, 100.0 * num / den, 0.0)
+        return pd.Series(tsi, index=bars.index)
+
+    def bands(self, bars: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """Return (upper, lower) MAD thresholds aligned with bars."""
+        tsi = self.tsi(bars)
+        basis = tsi.rolling(self.mad_len).mean()
+        mad = (tsi - basis).abs().rolling(self.mad_len).mean()
+        return self.mad_mult * mad, -self.mad_mult * mad
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        tsi = self.tsi(bars).to_numpy()
+        upper, lower = (x.to_numpy() for x in self.bands(bars))
+
+        out = np.zeros(len(tsi), dtype=int)
+        trend = 1  # `var int SQ = 1` in the script
+        for i in range(len(tsi)):
+            # NaN comparisons are False, so the trend holds through warm-up.
+            if tsi[i] > upper[i]:
+                trend = 1
+            if tsi[i] < lower[i]:
+                trend = -1
+            out[i] = int(trend == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
+def _percentile_nearest_rank(x: np.ndarray, n: int, pct: float) -> np.ndarray:
+    """Rolling nearest-rank percentile over the last `n` values (Pine `ta.percentile_nearest_rank`).
+
+    Rank k = ceil(pct / 100 * n), clamped to [1, n], taken from the ascending sort of the window.
+    A window containing NaN gives NaN.
+    """
+    out = np.full(len(x), np.nan)
+    if len(x) < n:
+        return out
+    windows = np.lib.stride_tricks.sliding_window_view(x, n)
+    ordered = np.sort(windows, axis=1)  # NaN sorts last
+    k = min(max(int(np.ceil(pct / 100.0 * n)), 1), n)
+    vals = ordered[:, k - 1]
+    vals = np.where(np.isnan(windows).any(axis=1), np.nan, vals)
+    out[n - 1 :] = vals
+    return out
+
+
+def _shift(x: np.ndarray, k: int) -> np.ndarray:
+    """x shifted forward by k bars: out[t] = x[t - k], NaN where t < k."""
+    out = np.full(len(x), np.nan)
+    if k == 0:
+        return x.astype(float).copy()
+    out[k:] = x[:-k]
+    return out
+
+
+class AdaptiveEhlersPercentile(Strategy):
+    """Port of the Pine script "Adaptive Ehlers Filtered Percentile" (SchizoQuant), as a long/flat strategy.
+
+    Adaptive MA: s = stdev(src - src[1], vol_len) (population); s_avg = SMA(s, vol_len); the adaptive length moves
+    linearly from ma_max (calm, s <= 0.25 s_avg) to ma_min (volatile, s >= 1.75 s_avg). alpha = 2 / (length + 1).
+    The average re-seeds from src whenever its previous value is NaN, as in the script.
+    Ehlers filter (trend): over the last filter_len values, weight |a[i] - a[i + momentum_len]| times a[i];
+    trend = sum(weight * a) / sum(weight), falling back to SMA(a, filter_len) when the weights sum to 0.
+    Band distance: nearest-rank percentile(percentile_level) of |src - trend| over percentile_len bars.
+    Upper = trend + distance * upper_mult, lower = trend - distance * lower_mult.
+    Regime latch (as in the script, starting flat): src > upper sets +1 (long); src < lower sets -1 (flat).
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Every value uses only past
+    and present bars.
+    """
+
+    name = "adaptive_ehlers_percentile"
+
+    def __init__(
+        self,
+        source: str = "close",
+        ma_min: int = 3,
+        ma_max: int = 30,
+        vol_len: int = 9,
+        filter_len: int = 9,
+        momentum_len: int = 15,
+        percentile_len: int = 50,
+        percentile_level: float = 75.0,
+        upper_mult: float = 0.7,
+        lower_mult: float = 0.7,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adaptive_ehlers_percentile source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.ma_min = int(ma_min)
+        self.ma_max = int(ma_max)
+        self.vol_len = int(vol_len)
+        self.filter_len = int(filter_len)
+        self.momentum_len = int(momentum_len)
+        self.percentile_len = int(percentile_len)
+        self.percentile_level = float(percentile_level)
+        self.upper_mult = float(upper_mult)
+        self.lower_mult = float(lower_mult)
+        if self.ma_min < 1 or self.ma_max < 2 or self.ma_min > self.ma_max:
+            raise ValueError("adaptive_ehlers_percentile needs 1 <= ma_min <= ma_max, ma_max >= 2")
+        if self.vol_len < 2 or self.filter_len < 2 or self.momentum_len < 1 or self.percentile_len < 2:
+            raise ValueError("adaptive_ehlers_percentile: vol_len, filter_len >= 2, momentum_len >= 1, percentile_len >= 2")
+        if not 1.0 <= self.percentile_level <= 99.0:
+            raise ValueError("adaptive_ehlers_percentile percentile_level must be in [1, 99]")
+        if self.upper_mult < 0.1 or self.lower_mult < 0.1:
+            raise ValueError("adaptive_ehlers_percentile multipliers must be >= 0.1")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "ma_min": self.ma_min,
+            "ma_max": self.ma_max,
+            "vol_len": self.vol_len,
+            "filter_len": self.filter_len,
+            "momentum_len": self.momentum_len,
+            "percentile_len": self.percentile_len,
+            "percentile_level": self.percentile_level,
+            "upper_mult": self.upper_mult,
+            "lower_mult": self.lower_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (trend, upper, lower) arrays aligned with bars."""
+        src = self._source(bars)
+        delta = src - src.shift(1)
+        s = delta.rolling(self.vol_len).std(ddof=0).to_numpy()
+        s_avg = pd.Series(s).rolling(self.vol_len).mean().to_numpy()
+        s_min = s_avg * 0.25
+        s_max = s_avg * 1.75
+        vol_range = s_max - s_min
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # Pine: na comparisons are false, so a NaN volatility gives NaN and a NaN range falls to ma_max.
+            length = np.where(
+                vol_range > 0.0,
+                np.where(
+                    s <= s_min,
+                    self.ma_max,
+                    np.where(
+                        s >= s_max,
+                        self.ma_min,
+                        self.ma_max - (self.ma_max - self.ma_min) * (s - s_min) / vol_range,
+                    ),
+                ),
+                self.ma_max,
+            )
+            alpha = 2.0 / (length + 1.0)
+
+        x = src.to_numpy()
+        ama = np.full(len(x), np.nan)
+        prev = np.nan
+        for t in range(len(x)):
+            if np.isnan(prev):  # na(adaptiveMA[1]): re-seed from the source
+                cur = x[t]
+            else:
+                cur = prev + alpha[t] * (x[t] - prev)
+            ama[t] = cur
+            prev = cur
+
+        num = np.zeros(len(ama))
+        den = np.zeros(len(ama))
+        for i in range(self.filter_len):
+            cur_s = _shift(ama, i)
+            ref_s = _shift(ama, i + self.momentum_len)
+            valid = np.isfinite(cur_s) & np.isfinite(ref_s)
+            coef = np.where(valid, np.abs(cur_s - ref_s), 0.0)
+            num += np.where(valid, coef * np.where(valid, cur_s, 0.0), 0.0)
+            den += coef
+        fallback = pd.Series(ama).rolling(self.filter_len).mean().to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            trend = np.where(den > 0.0, num / den, fallback)
+
+        dist = _percentile_nearest_rank(np.abs(x - trend), self.percentile_len, self.percentile_level)
+        return trend, trend + dist * self.upper_mult, trend - dist * self.lower_mult
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        _, upper, lower = self.bands(bars)
+        x = self._source(bars).to_numpy()
+
+        out = np.zeros(len(x), dtype=int)
+        regime = 0  # `var int SQ = 0`
+        for i in range(len(x)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if x[i] > upper[i]:
+                regime = 1
+            elif x[i] < lower[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -846,6 +1112,8 @@ REGISTRY: dict[str, type[Strategy]] = {
         RmaAtrBands,
         ProjectedCrossover,
         DualMaSdOscillator,
+        DoubleSmoothedMadTrend,
+        AdaptiveEhlersPercentile,
     )
 }
 

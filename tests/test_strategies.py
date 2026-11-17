@@ -246,3 +246,73 @@ def test_dual_ma_sd_oscillator_rejects_bad_params():
         DualMaSdOscillator(upper_sd_len=0)
     with pytest.raises(ValueError):
         DualMaSdOscillator(source="volume")
+
+
+def test_double_smoothed_mad_trend_starts_long_and_latches():
+    """The script starts with trend = +1. A falling series latches flat and a rising one latches long."""
+    import numpy as np
+    from ibbt.strategies import DoubleSmoothedMadTrend
+
+    n = 200
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 160, 100), np.linspace(160, 90, 100)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    strat = DoubleSmoothedMadTrend()
+    sig = strat.signal(bars)
+    assert sig.iloc[0] == 1  # var int SQ = 1: long before any signal
+    assert sig.iloc[90] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_double_smoothed_mad_tsi_is_zero_when_denominator_is_zero():
+    import numpy as np
+    from ibbt.strategies import DoubleSmoothedMadTrend
+
+    idx = pd.bdate_range("2020-01-01", periods=40)
+    bars = pd.DataFrame({"open": 50.0, "high": 50.0, "low": 50.0, "close": 50.0, "volume": 1.0}, index=idx)
+    tsi = DoubleSmoothedMadTrend().tsi(bars)
+    assert np.isnan(tsi.iloc[:20]).all()  # the second EMA(20) is still warming up
+    assert (tsi.iloc[25:] == 0.0).all()  # flat prices: momentum and its absolute value are 0
+
+
+def test_double_smoothed_mad_rejects_bad_params():
+    from ibbt.strategies import DoubleSmoothedMadTrend
+
+    with pytest.raises(ValueError):
+        DoubleSmoothedMadTrend(mad_len=1)
+    with pytest.raises(ValueError):
+        DoubleSmoothedMadTrend(mad_mult=0.05)
+
+
+def test_nearest_rank_percentile_matches_definition():
+    import numpy as np
+    from ibbt.strategies import _percentile_nearest_rank
+
+    x = np.array([5.0, 1.0, 4.0, 2.0, 3.0])
+    out = _percentile_nearest_rank(x, 5, 60.0)  # rank = ceil(0.6 * 5) = 3 -> third smallest
+    assert np.isnan(out[:4]).all()
+    assert out[4] == pytest.approx(3.0)
+
+
+def test_adaptive_ehlers_percentile_regimes():
+    """Starts flat, goes long on a breakout above the percentile band, and goes flat on a breakdown."""
+    import numpy as np
+    from ibbt.strategies import AdaptiveEhlersPercentile
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = AdaptiveEhlersPercentile().signal(bars)
+    assert sig.iloc[:30].sum() == 0
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adaptive_ehlers_percentile_rejects_bad_params():
+    from ibbt.strategies import AdaptiveEhlersPercentile
+
+    with pytest.raises(ValueError):
+        AdaptiveEhlersPercentile(ma_min=40, ma_max=30)
+    with pytest.raises(ValueError):
+        AdaptiveEhlersPercentile(percentile_level=100)
