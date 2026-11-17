@@ -557,16 +557,25 @@ class ChampionDailySetup(Strategy):
 
 
 def _rma(x: np.ndarray, n: int) -> np.ndarray:
-    """Wilder's moving average, matching Pine's `ta.rma`.
+    """Wilder's moving average, matching Pine's `ta.rma` (alpha = 1/n)."""
+    return _seeded_average(x, n, 1.0 / n)
 
-    Seeded with the simple average of the first `n` values, then
-    rma_t = rma_{t-1} + (x_t - rma_{t-1}) / n. NaN inputs are skipped and leave the average unchanged.
+
+def _ema(x: np.ndarray, n: int) -> np.ndarray:
+    """Exponential moving average, matching Pine's `ta.ema` (alpha = 2/(n+1)), seeded like `_rma`."""
+    return _seeded_average(x, n, 2.0 / (n + 1))
+
+
+def _seeded_average(x: np.ndarray, n: int, alpha: float) -> np.ndarray:
+    """Pine-style recursive average.
+
+    Seeded with the simple average of the first `n` finite values, then
+    avg_t = avg_{t-1} + alpha * (x_t - avg_{t-1}). NaN inputs are skipped and leave the average unchanged.
     """
     out = np.full(len(x), np.nan)
     finite = np.flatnonzero(np.isfinite(x))
     if len(finite) < n:
         return out
-    alpha = 1.0 / n
     seed_pos = finite[n - 1]  # the bar where n finite values are available
     prev = float(np.mean(x[finite[:n]]))
     out[seed_pos] = prev
@@ -666,6 +675,83 @@ class RmaAtrBands(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class ProjectedCrossover(Strategy):
+    """Port of the Pine script "Projected Crossover Trend" (SchizoQuant), as a long/flat strategy.
+
+    fastMA = EMA(src, fast_len), slowMA = SMA(src, slow_len). projected = fast_len * (fastMA - slowMA).
+    MDI = EMA(100 * (projected - projected_prev) / close, smooth_len).
+    Trend latch (as in the script): MDI > 0 and close > close[slow_len] sets the trend to +1 (long);
+    MDI < 0 and close < close[slow_len] sets it to -1 (short). Between signals the trend holds its last value.
+    Long while the trend is +1, flat otherwise. The short signal is the exit. The engine trades the next open.
+    Every value uses only bars up to its own close.
+    """
+
+    name = "projected_crossover"
+
+    def __init__(
+        self,
+        source: str = "close",
+        fast_len: int = 10,
+        slow_len: int = 30,
+        smooth_len: int = 5,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("projected_crossover source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        fast_len, slow_len, smooth_len = int(fast_len), int(slow_len), int(smooth_len)
+        if fast_len < 2 or slow_len < 3 or smooth_len < 1:
+            raise ValueError("projected_crossover needs fast_len >= 2, slow_len >= 3, smooth_len >= 1")
+        self.source = source
+        self.fast_len = fast_len
+        self.slow_len = slow_len
+        self.smooth_len = smooth_len
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "fast_len": self.fast_len,
+            "slow_len": self.slow_len,
+            "smooth_len": self.smooth_len,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def mdi(self, bars: pd.DataFrame) -> pd.Series:
+        """Market Direction Indicator, aligned with bars."""
+        src = self._source(bars)
+        close = bars["close"].astype(float)
+        fast_ma = _ema(src.to_numpy(), self.fast_len)
+        slow_ma = src.rolling(self.slow_len).mean().to_numpy()
+        projected = self.fast_len * (fast_ma - slow_ma)
+        raw = 100 * (projected - pd.Series(projected, index=bars.index).shift(1).to_numpy()) / close.to_numpy()
+        return pd.Series(_ema(raw, self.smooth_len), index=bars.index)
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        mdi = self.mdi(bars).to_numpy()
+        close = bars["close"].astype(float).to_numpy()
+        past = bars["close"].astype(float).shift(self.slow_len).to_numpy()  # close[slow_len]
+
+        out = np.zeros(len(close), dtype=int)
+        trend = 0
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period keeps the trend at 0 (flat).
+            if mdi[i] > 0 and close[i] > past[i]:
+                trend = 1
+            if mdi[i] < 0 and close[i] < past[i]:
+                trend = -1
+            out[i] = int(trend == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -679,6 +765,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         HigherHighStructure,
         ChampionDailySetup,
         RmaAtrBands,
+        ProjectedCrossover,
     )
 }
 

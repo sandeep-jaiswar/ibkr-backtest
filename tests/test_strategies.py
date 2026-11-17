@@ -161,3 +161,47 @@ def test_rma_atr_bands_rejects_bad_params():
         RmaAtrBands(source="volume")
     with pytest.raises(ValueError):
         RmaAtrBands(ma_length=0)
+
+
+def test_ema_matches_pine_definition():
+    """Pine ta.ema: seeded with the SMA of the first n values, then alpha = 2/(n+1)."""
+    import numpy as np
+
+    from ibbt.strategies import _ema
+
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    out = _ema(x, 3)
+    alpha = 2 / 4
+    assert np.isnan(out[:2]).all()
+    assert out[2] == pytest.approx(2.0)
+    assert out[3] == pytest.approx(2.0 + alpha * (4.0 - 2.0))
+    assert out[4] == pytest.approx(out[3] + alpha * (5.0 - out[3]))
+
+
+def test_projected_crossover_follows_uptrend_and_downtrend():
+    """A rising series latches long once MDI and the slow-lag test agree; a falling one latches flat."""
+    import numpy as np
+    from ibbt.strategies import ProjectedCrossover
+
+    n = 200
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    up = np.linspace(100, 200, 120)
+    down = np.linspace(200, 80, 80)
+    close = np.r_[up, down]
+    bars = pd.DataFrame(
+        {"open": close, "high": close + 1.0, "low": close - 1.0, "close": close, "volume": 1.0}, index=idx
+    )
+    strat = ProjectedCrossover()
+    sig = strat.signal(bars)
+    assert sig.iloc[:30].sum() == 0  # warm-up stays flat
+    assert sig.iloc[100] == 1  # well into the uptrend
+    assert sig.iloc[-1] == 0  # the falling leg latches the short side
+
+
+def test_projected_crossover_rejects_bad_params():
+    from ibbt.strategies import ProjectedCrossover
+
+    with pytest.raises(ValueError):
+        ProjectedCrossover(fast_len=1)
+    with pytest.raises(ValueError):
+        ProjectedCrossover(source="volume")
