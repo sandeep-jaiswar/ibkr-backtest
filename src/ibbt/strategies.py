@@ -1590,6 +1590,110 @@ class AdaptivePersistenceTrail(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class AdaptiveVidya(Strategy):
+    """Port of the Pine script "Adaptive VIDYA Trend" (SchizoQuant), as a long/flat strategy.
+
+    k = stdev(src, short_len) / stdev(src, long_len) (0 when the long deviation is not positive), so NaN warm-up
+    gives k = 0. alpha = clamp(k * base_smoothing, 0, 1).
+    VIDYA = alpha * src + (1 - alpha) * VIDYA[1], re-seeded from src when the previous value is NaN.
+    Residual = src - VIDYA; residual deviation = stdev(residual, band_len) (population).
+    Upper = VIDYA + upper_mult * deviation; lower = VIDYA - lower_mult * deviation.
+    Regime latch (starts bullish: `var int SQ = src >= vidya ? 1 : -1`, true on the first bar):
+    src > upper sets +1 (long); src < lower sets -1 (flat). Long while the regime is +1, flat otherwise.
+    The engine trades the next open. Only past and present bars are used.
+    """
+
+    name = "adaptive_vidya"
+
+    def __init__(
+        self,
+        source: str = "close",
+        short_len: int = 10,
+        long_len: int = 30,
+        base_smoothing: float = 0.20,
+        band_len: int = 20,
+        upper_mult: float = 1.5,
+        lower_mult: float = 1.5,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adaptive_vidya source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.short_len = int(short_len)
+        self.long_len = int(long_len)
+        self.base_smoothing = float(base_smoothing)
+        self.band_len = int(band_len)
+        self.upper_mult = float(upper_mult)
+        self.lower_mult = float(lower_mult)
+        if self.short_len < 2 or self.long_len < 3 or self.band_len < 2:
+            raise ValueError("adaptive_vidya needs short_len >= 2, long_len >= 3, band_len >= 2")
+        if not 0.01 <= self.base_smoothing <= 1.0:
+            raise ValueError("adaptive_vidya base_smoothing must be in [0.01, 1]")
+        if self.upper_mult < 0.1 or self.lower_mult < 0.1:
+            raise ValueError("adaptive_vidya multipliers must be >= 0.1")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "short_len": self.short_len,
+            "long_len": self.long_len,
+            "base_smoothing": self.base_smoothing,
+            "band_len": self.band_len,
+            "upper_mult": self.upper_mult,
+            "lower_mult": self.lower_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (vidya, upper, lower) arrays aligned with bars."""
+        src_s = self._source(bars)
+        src = src_s.to_numpy()
+
+        short_dev = src_s.rolling(self.short_len).std(ddof=0).to_numpy()
+        long_dev = src_s.rolling(self.long_len).std(ddof=0).to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            k = np.where(long_dev > 0.0, short_dev / long_dev, 0.0)
+        alpha = np.maximum(0.0, np.minimum(1.0, k * self.base_smoothing))
+
+        vidya = np.full(len(src), np.nan)
+        prev = np.nan
+        for t in range(len(src)):
+            cur = src[t] if np.isnan(prev) else alpha[t] * src[t] + (1.0 - alpha[t]) * prev
+            vidya[t] = cur
+            prev = cur
+
+        residual = src - vidya
+        resid_dev = pd.Series(residual).rolling(self.band_len).std(ddof=0).to_numpy()
+        upper = vidya + resid_dev * self.upper_mult
+        lower = vidya - resid_dev * self.lower_mult
+        return vidya, upper, lower
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        vidya, upper, lower = self.bands(bars)
+        src = self._source(bars).to_numpy()
+
+        out = np.zeros(len(src), dtype=int)
+        regime = 1 if src[0] >= vidya[0] else -1  # `var int SQ = src >= vidya ? 1 : -1`
+        for i in range(len(src)):
+            # NaN comparisons are False, so the warm-up period keeps the regime.
+            if src[i] > upper[i]:
+                regime = 1
+            elif src[i] < lower[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1610,6 +1714,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         VolatilityAdaptiveTrend,
         MesaPhaseBandTrend,
         AdaptivePersistenceTrail,
+        AdaptiveVidya,
     )
 }
 

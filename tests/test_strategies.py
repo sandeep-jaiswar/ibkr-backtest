@@ -409,3 +409,38 @@ def test_adaptive_persistence_trail_rejects_bad_params():
         AdaptivePersistenceTrail(persistence_len=1)
     with pytest.raises(ValueError):
         AdaptivePersistenceTrail(max_acc=1.5)
+
+
+def test_adaptive_vidya_regimes():
+    """Starts bullish, goes long on a rally breakout, and goes flat once a selloff breaks the lower band."""
+    import numpy as np
+    from ibbt.strategies import AdaptiveVidya
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = AdaptiveVidya().signal(bars)
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adaptive_vidya_constant_price_tracks_price():
+    import numpy as np
+    from ibbt.strategies import AdaptiveVidya
+
+    idx = pd.bdate_range("2020-01-01", periods=80)
+    bars = pd.DataFrame({"open": 50.0, "high": 50.0, "low": 50.0, "close": 50.0, "volume": 1.0}, index=idx)
+    vidya, upper, lower = AdaptiveVidya().bands(bars)
+    assert np.allclose(vidya, 50.0)  # with no price movement the average stays at the price
+    # The bands collapse onto the price, so nothing breaks out and the bullish starting regime never changes.
+    assert AdaptiveVidya().signal(bars).sum() == len(bars)
+
+
+def test_adaptive_vidya_rejects_bad_params():
+    from ibbt.strategies import AdaptiveVidya
+
+    with pytest.raises(ValueError):
+        AdaptiveVidya(short_len=1)
+    with pytest.raises(ValueError):
+        AdaptiveVidya(base_smoothing=0.0)
