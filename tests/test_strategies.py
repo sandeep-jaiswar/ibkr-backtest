@@ -444,3 +444,38 @@ def test_adaptive_vidya_rejects_bad_params():
         AdaptiveVidya(short_len=1)
     with pytest.raises(ValueError):
         AdaptiveVidya(base_smoothing=0.0)
+
+
+def test_adaptive_supersmoother_regimes():
+    """Starts flat, goes long on a sustained rally, and goes flat on a sustained selloff."""
+    import numpy as np
+    from ibbt.strategies import AdaptiveSuperSmoother
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = AdaptiveSuperSmoother().signal(bars)
+    assert sig.iloc[:20].sum() == 0
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adaptive_supersmoother_constant_price_is_flat():
+    import numpy as np
+    from ibbt.strategies import AdaptiveSuperSmoother
+
+    idx = pd.bdate_range("2020-01-01", periods=80)
+    bars = pd.DataFrame({"open": 50.0, "high": 50.0, "low": 50.0, "close": 50.0, "volume": 1.0}, index=idx)
+    trend, eff = AdaptiveSuperSmoother().trend(bars)
+    assert np.allclose(trend[5:], 50.0)
+    assert AdaptiveSuperSmoother().signal(bars).sum() == 0  # no slope, so no regime change from flat
+
+
+def test_adaptive_supersmoother_rejects_bad_params():
+    from ibbt.strategies import AdaptiveSuperSmoother
+
+    with pytest.raises(ValueError):
+        AdaptiveSuperSmoother(smooth_len=2)
+    with pytest.raises(ValueError):
+        AdaptiveSuperSmoother(ma_min=60, ma_max=50)

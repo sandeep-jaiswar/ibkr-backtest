@@ -1694,6 +1694,153 @@ class AdaptiveVidya(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class AdaptiveSuperSmoother(Strategy):
+    """Port of the Pine script "Adaptive SuperSmoother" (SchizoQuant), as a long/flat strategy.
+
+    Adaptive MA: s = stdev(src - src[1], vol_len); sMean = SMA(s, vol_len); the volatility position
+    clamps (s - 0.25 sMean) / (1.5 sMean) to [0, 1]. The period moves from ma_max (calm) to ma_min (volatile),
+    alpha = 2 / (period + 1), and the average re-seeds from src when its previous value is NaN.
+    SuperSmoother (Ehlers, 2-pole) on the adaptive MA with `smooth_len`; re-seeded from the adaptive MA in warm-up.
+    Efficiency = |src - src[er_len]| / sum of |src[i] - src[i+1]| over er_len bars, clamped to [0, 1].
+    fastWeight = fast_bias + (1 - fast_bias) * efficiency; trend = adaptiveMA * fastWeight + smooth * (1 - fastWeight).
+    Slope = trend - trend[1]; threshold = RMA(|slope|, noise_len) * noise_mult.
+    Regime latch (starts flat): slope > threshold sets +1 (long); slope < -threshold sets -1 (flat).
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    """
+
+    name = "adaptive_supersmoother"
+
+    def __init__(
+        self,
+        source: str = "close",
+        ma_min: int = 14,
+        ma_max: int = 50,
+        vol_len: int = 9,
+        smooth_len: int = 3,
+        er_len: int = 10,
+        fast_bias: float = 0.30,
+        noise_len: int = 20,
+        noise_mult: float = 0.60,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adaptive_supersmoother source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.ma_min = int(ma_min)
+        self.ma_max = int(ma_max)
+        self.vol_len = int(vol_len)
+        self.smooth_len = int(smooth_len)
+        self.er_len = int(er_len)
+        self.fast_bias = float(fast_bias)
+        self.noise_len = int(noise_len)
+        self.noise_mult = float(noise_mult)
+        if self.ma_min < 1 or self.ma_max < 2 or self.ma_min > self.ma_max:
+            raise ValueError("adaptive_supersmoother needs 1 <= ma_min <= ma_max and ma_max >= 2")
+        if self.vol_len < 2 or self.smooth_len < 3 or self.er_len < 2 or self.noise_len < 2:
+            raise ValueError("adaptive_supersmoother: vol_len >= 2, smooth_len >= 3, er_len >= 2, noise_len >= 2")
+        if not 0.0 <= self.fast_bias <= 1.0 or self.noise_mult < 0.0:
+            raise ValueError("adaptive_supersmoother: fast_bias in [0, 1] and noise_mult >= 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "ma_min": self.ma_min,
+            "ma_max": self.ma_max,
+            "vol_len": self.vol_len,
+            "smooth_len": self.smooth_len,
+            "er_len": self.er_len,
+            "fast_bias": self.fast_bias,
+            "noise_len": self.noise_len,
+            "noise_mult": self.noise_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def trend(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """Return (trend, efficiency) arrays aligned with bars."""
+        src_s = self._source(bars)
+        s_src = src_s.to_numpy()
+        n = len(s_src)
+
+        def filled(k: int) -> np.ndarray:
+            """src[t - k], with nz(src[k], src): the current source where that value is NaN."""
+            arr = _shift(s_src, k)
+            return np.where(np.isnan(arr), s_src, arr)
+
+        delta = s_src - _shift(s_src, 1)
+        sd = pd.Series(delta).rolling(self.vol_len).std(ddof=0).to_numpy()
+        s_mean = pd.Series(sd).rolling(self.vol_len).mean().to_numpy()
+        s_min = s_mean * 0.25
+        s_max = s_mean * 1.75
+        vol_range = s_max - s_min
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vol_pos = np.where(vol_range > 0.0, np.maximum(0.0, np.minimum(1.0, (sd - s_min) / vol_range)), 0.0)
+            length = np.where(sd <= s_min, self.ma_max, np.where(sd >= s_max, self.ma_min, self.ma_max - (self.ma_max - self.ma_min) * vol_pos))
+            alpha = 2.0 / (length + 1.0)
+
+        adaptive = np.full(n, np.nan)
+        prev = np.nan
+        for t in range(n):
+            cur = s_src[t] if np.isnan(prev) else prev + alpha[t] * (s_src[t] - prev)
+            adaptive[t] = cur
+            prev = cur
+
+        # SuperSmoother coefficients, as in the script (fixed for the whole run).
+        a1 = np.exp(-1.414 * np.pi / self.smooth_len)
+        b1 = 2.0 * a1 * np.cos(1.414 * np.pi / self.smooth_len)
+        c2 = b1
+        c3 = -a1 * a1
+        c1 = 1.0 - c2 - c3
+
+        smooth = np.full(n, np.nan)
+        for t in range(n):
+            p1 = smooth[t - 1] if t >= 1 else np.nan
+            p2 = smooth[t - 2] if t >= 2 else np.nan
+            if np.isnan(p1) or np.isnan(p2):
+                smooth[t] = adaptive[t]
+            else:
+                a_prev = adaptive[t - 1] if t >= 1 and not np.isnan(adaptive[t - 1]) else adaptive[t]
+                smooth[t] = c1 * (adaptive[t] + a_prev) * 0.5 + c2 * p1 + c3 * p2
+
+        direction = np.abs(s_src - filled(self.er_len))
+        noise = np.zeros(n)
+        for i in range(self.er_len):
+            noise += np.abs(filled(i) - filled(i + 1))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            eff = np.where(noise > 0.0, direction / noise, 0.0)
+        eff = np.maximum(0.0, np.minimum(1.0, eff))
+
+        fast_w = self.fast_bias + (1.0 - self.fast_bias) * eff
+        slow_w = 1.0 - fast_w
+        return adaptive * fast_w + smooth * slow_w, eff
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        trend, _ = self.trend(bars)
+        slope = trend - _shift(trend, 1)
+        slope_noise = _rma(np.abs(slope), self.noise_len)
+        threshold = slope_noise * self.noise_mult
+
+        out = np.zeros(len(trend), dtype=int)
+        regime = 0  # `var int SQ = 0`
+        for i in range(len(trend)):
+            # NaN comparisons are false, so warm-up keeps the regime flat.
+            if slope[i] > threshold[i]:
+                regime = 1
+            elif slope[i] < -threshold[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1715,6 +1862,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         MesaPhaseBandTrend,
         AdaptivePersistenceTrail,
         AdaptiveVidya,
+        AdaptiveSuperSmoother,
     )
 }
 
