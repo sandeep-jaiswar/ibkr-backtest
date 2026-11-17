@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -53,6 +54,8 @@ class PortfolioConfig:
     stop_pct: float | None = None  # exit when the low reaches entry * (1 - stop_pct)
     target_pct: float | None = None  # exit when the high reaches entry * (1 + target_pct)
     max_hold: int | None = None  # exit at the open once a position is held this many bars
+    signal_exit: bool = True  # False: a signal only opens a position; exits come from stop, target or time
+    fill_max_risk: float | None = None  # level-based entries: skip if (fill - stop) / fill exceeds this
 
     def __post_init__(self) -> None:
         if self.position_size <= 0:
@@ -82,6 +85,8 @@ class PortfolioConfig:
             "stop_pct": self.stop_pct if self.stop_pct is not None else "none",
             "target_pct": self.target_pct if self.target_pct is not None else "none",
             "max_hold": self.max_hold if self.max_hold is not None else "none",
+            "signal_exit": self.signal_exit,
+            "fill_max_risk": self.fill_max_risk if self.fill_max_risk is not None else "none",
         }
 
 
@@ -102,6 +107,8 @@ def run_portfolio(
     cfg: PortfolioConfig,
     rank: pd.DataFrame | None = None,
     seed: int = 0,
+    stop_levels: pd.DataFrame | None = None,
+    target_levels: pd.DataFrame | None = None,
 ) -> PortfolioResult:
     """Simulate one account over wide frames (dates x symbols). NaN means no bar for that symbol that day.
 
@@ -110,20 +117,20 @@ def run_portfolio(
     """
     dates = opens.index
     cols = opens.columns
-    O = opens.to_numpy(dtype=float)
+    OPN = opens.to_numpy(dtype=float)
     H = highs.reindex(index=dates, columns=cols).to_numpy(dtype=float)
     L = lows.reindex(index=dates, columns=cols).to_numpy(dtype=float)
     C = closes.reindex(index=dates, columns=cols).to_numpy(dtype=float)
     S = signal.reindex(index=dates, columns=cols).fillna(0).to_numpy(dtype=np.int8)
     if rank is None:
-        R = np.random.default_rng(seed).random(O.shape)
+        R = np.random.default_rng(seed).random(OPN.shape)
     else:
         R = rank.reindex(index=dates, columns=cols).to_numpy(dtype=float)
         R = np.where(np.isnan(R), np.inf, R)
 
-    n, m = O.shape
+    n, m = OPN.shape
     constrained = cfg.max_positions is not None
-    limit = cfg.max_positions if constrained else m
+    limit: int = cfg.max_positions if cfg.max_positions is not None else m
     slip = cfg.slippage_bps / 10_000
     comm = cfg.commission_bps / 10_000
 
@@ -132,11 +139,15 @@ def run_portfolio(
     shares = np.zeros(m)
     entry_px = np.zeros(m)
     entry_i = np.zeros(m, dtype=int)
+    stop_abs = np.full(m, np.nan)  # absolute stop price per open position; NaN = no stop
+    target_abs = np.full(m, np.nan)  # absolute target price per open position; NaN = no target
+    SL = stop_levels.reindex(index=dates, columns=cols).to_numpy(dtype=float) if stop_levels is not None else None
+    TL = target_levels.reindex(index=dates, columns=cols).to_numpy(dtype=float) if target_levels is not None else None
     last_close = np.full(m, np.nan)
-    trades: list[dict] = []
+    trades: list[tuple] = []  # packed rows; converted to a DataFrame once, after the loop
     skipped = 0
 
-    def close_position(j: int, i: int, base: float, reason: str) -> None:
+    def close_position(j: Any, i: Any, base: float, reason: str) -> None:
         # Hot path: plain numbers only. Dates are resolved once, after the loop.
         nonlocal cash
         fill = base * (1 - slip)
@@ -152,13 +163,14 @@ def run_portfolio(
     for i in range(n):
         if i > 0:
             # 1. Signal exits: the order was decided at the previous close and fills at this open.
-            for j in np.flatnonzero(held & (S[i - 1] == 0)):
-                if np.isfinite(O[i, j]):
-                    close_position(j, i, O[i, j], "signal")
+            if cfg.signal_exit:
+                for j in np.flatnonzero(held & (S[i - 1] == 0)):
+                    if np.isfinite(OPN[i, j]):
+                        close_position(j, i, OPN[i, j], "signal")
 
             # 2. Entries: candidates that were long at the previous close, best rank first.
             free = limit - int(held.sum())
-            candidates = np.flatnonzero((S[i - 1] == 1) & ~held & np.isfinite(O[i]) & (O[i] > 0))
+            candidates = np.flatnonzero((S[i - 1] == 1) & ~held & np.isfinite(OPN[i]) & (OPN[i] > 0))
             if candidates.size:
                 candidates = candidates[np.argsort(R[i - 1, candidates], kind="stable")]
             for j in candidates:
@@ -166,10 +178,31 @@ def run_portfolio(
                 if free <= 0 or (constrained and size < cfg.min_position_size):
                     skipped += 1
                     continue
-                fill = O[i, j] * (1 + slip)
+                fill = OPN[i, j] * (1 + slip)
+                if SL is not None:
+                    # Level-based entries are skipped unless the stop is below the fill, the target is above it
+                    # (a gap-up through the target means no trade), and the risk at the fill is within limit.
+                    stop_v = SL[i - 1, j]
+                    target_v = TL[i - 1, j] if TL is not None else np.nan
+                    if not np.isfinite(stop_v) or stop_v >= fill:
+                        skipped += 1
+                        continue
+                    if (
+                        TL is not None and np.isfinite(target_v) and target_v <= fill
+                    ):  # NaN target = no target, stop only
+                        skipped += 1
+                        continue
+                    if cfg.fill_max_risk is not None and (fill - stop_v) / fill > cfg.fill_max_risk:
+                        skipped += 1
+                        continue
+                else:
+                    stop_v = fill * (1 - cfg.stop_pct) if cfg.stop_pct is not None else np.nan
+                    target_v = fill * (1 + cfg.target_pct) if cfg.target_pct is not None else np.nan
                 shares[j] = size / (fill * (1 + comm))
                 entry_px[j] = fill
                 entry_i[j] = i
+                stop_abs[j] = stop_v
+                target_abs[j] = target_v
                 last_close[j] = fill
                 held[j] = True
                 cash -= size
@@ -178,19 +211,19 @@ def run_portfolio(
         # 3. Intrabar exits on today's range. If the stop and target both sit inside the bar,
         #    the stop is assumed to fill first, which is the conservative order.
         for j in np.flatnonzero(held):
-            o, h, lo = O[i, j], H[i, j], L[i, j]
+            o, h, lo = OPN[i, j], H[i, j], L[i, j]
             if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(lo)):
                 continue
-            stop_px = entry_px[j] * (1 - cfg.stop_pct) if cfg.stop_pct is not None else None
-            target_px = entry_px[j] * (1 + cfg.target_pct) if cfg.target_pct is not None else None
+            # NaN means no stop or target; every comparison with NaN is False, so those rules simply never fire.
+            stop_px, target_px = stop_abs[j], target_abs[j]
             reason, base = None, 0.0
-            if stop_px is not None and o <= stop_px:
+            if o <= stop_px:
                 reason, base = "stop", o  # gapped through the stop: fill at the open
-            elif target_px is not None and o >= target_px:
+            elif o >= target_px:
                 reason, base = "target", o  # gapped above the target: fill at the open
-            elif stop_px is not None and lo <= stop_px:
+            elif lo <= stop_px:
                 reason, base = "stop", stop_px
-            elif target_px is not None and h >= target_px:
+            elif h >= target_px:
                 reason, base = "target", target_px
             elif cfg.max_hold is not None and i - entry_i[j] >= cfg.max_hold:
                 reason, base = "time", o
@@ -209,7 +242,9 @@ def run_portfolio(
         cost = shares[j] * entry_px[j] * (1 + comm)
         trades.append((j, entry_i[j], n - 1, entry_px[j], fill, "end", proceeds - cost, proceeds / cost - 1, True))
 
-    table = pd.DataFrame(trades, columns=["sym", "ei", "xi", "entry_price", "exit_price", "exit_reason", "pnl", "pnl_pct", "open"])
+    table = pd.DataFrame(
+        trades, columns=["sym", "ei", "xi", "entry_price", "exit_price", "exit_reason", "pnl", "pnl_pct", "open"]
+    )
     trade_df = pd.DataFrame(
         {
             "symbol": cols.to_numpy()[table["sym"].to_numpy(dtype=int)],

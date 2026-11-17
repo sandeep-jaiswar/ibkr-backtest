@@ -23,7 +23,11 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import multiprocessing as mp
+import os
 import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
@@ -33,10 +37,12 @@ import duckdb
 import mlflow
 import numpy as np
 import pandas as pd
+from mlflow.entities import Metric, Param
+from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID
 
 from ibbt.config import Settings
 from ibbt.portfolio import PortfolioConfig, portfolio_metrics, run_portfolio
-from ibbt.strategies import make_strategy
+from ibbt.strategies import REGISTRY, make_strategy
 
 EXPERIMENT = "ibkr-portfolio"
 WINDOWS: dict[str, tuple[date, date]] = {
@@ -51,12 +57,24 @@ GOAL = {"min_profit_factor": 2.0, "min_win_rate": 0.5, "min_round_trips": 200}
 STRATEGY_GRID: dict[str, dict[str, list[Any]]] = {
     "rsi_pullback": {"entry_rsi": [5, 10], "exit_rsi": [60, 70], "trend": [50, 200]},
     "ibs_reversion": {"trend": [50, 200], "entry_ibs": [0.1, 0.2], "exit_ibs": [0.6, 0.8]},
+    "price_action_breakout": {
+        "breakout_lookback": [20, 55],
+        "support_lookback": [20, 40],
+        "support_tol": [0.01, 0.03],
+        "max_risk": [0.05, 0.10],
+        "leg": ["breakout", "bounce", "both"],
+    },
 }
+LEVEL_MAX_HOLD: list[int | None] = [None, 20, 40]  # time stops tried on top of a level-based stop and target
 # Exit rules applied on top of each strategy's signal exit.
+EXIT_PRESETS: dict[str, dict[str, list[Any]]] = {
+    # Round 1 exit grid (tight exits).
+    "r1": {"stop_pct": [None, 0.03, 0.05], "target_pct": [None, 0.04, 0.06, 0.10], "max_hold": [None]},
+}
 EXIT_GRID: dict[str, list[Any]] = {
-    "stop_pct": [None, 0.03, 0.05],
-    "target_pct": [None, 0.04, 0.06, 0.10],
-    "max_hold": [None],
+    "stop_pct": [None, 0.05, 0.10],
+    "target_pct": [None, 0.10, 0.20],
+    "max_hold": [None, 5, 10, 20],
 }
 
 
@@ -101,7 +119,17 @@ class Candidate:
         )
 
     def portfolio_cfg(self, base: PortfolioConfig) -> PortfolioConfig:
-        return replace(base, stop_pct=self.stop_pct, target_pct=self.target_pct, max_hold=self.max_hold)
+        cls = REGISTRY[self.strategy]
+        # Level-based strategies: the same max_risk that gates the signal also gates the fill.
+        fill_max_risk = self.params.get("max_risk") if cls.uses_levels else None
+        return replace(
+            base,
+            stop_pct=self.stop_pct,
+            target_pct=self.target_pct,
+            max_hold=self.max_hold,
+            signal_exit=cls.signal_exits,
+            fill_max_risk=fill_max_risk,
+        )
 
 
 def expand_candidates(
@@ -111,6 +139,7 @@ def expand_candidates(
 ) -> list[Candidate]:
     exit_keys = list(exit_grid)
     exit_combos = [dict(zip(exit_keys, v, strict=True)) for v in itertools.product(*exit_grid.values())]
+    level_combos = [{"stop_pct": None, "target_pct": None, "max_hold": h} for h in LEVEL_MAX_HOLD]
     out: list[Candidate] = []
     for name, space in strategy_grid.items():
         if strategies and name not in strategies:
@@ -122,7 +151,9 @@ def expand_candidates(
                 make_strategy(name, params)
             except ValueError:
                 continue
-            for exits in exit_combos:
+            # Level-based strategies carry their own stop and target, so only a time-stop variant is searched.
+            combos = level_combos if REGISTRY[name].uses_levels else exit_combos
+            for exits in combos:
                 out.append(Candidate(name, tuple(sorted(params.items())), **exits))
     return out
 
@@ -134,16 +165,17 @@ class Universe:
     lows: pd.DataFrame
     closes: pd.DataFrame
     bars: dict[str, pd.DataFrame] = field(repr=False, default_factory=dict)
+    excluded_for_quality: int = 0  # symbols dropped by the data-quality screen
 
     @property
     def n_symbols(self) -> int:
         return len(self.opens.columns)
 
 
-def load_universe(db_path: str | Path, symbols: list[str] | None = None, min_bars: int = 250) -> Universe:
+def load_universe(db_path: str | Path, symbols: list[str] | None = None) -> Universe:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        sql = "SELECT symbol, ts, open, high, low, close FROM bars"
+        sql = "SELECT symbol, ts, open, high, low, close, volume FROM bars"
         params: list[Any] = []
         if symbols:
             sql += f" WHERE symbol IN ({','.join('?' * len(symbols))})"
@@ -152,34 +184,70 @@ def load_universe(db_path: str | Path, symbols: list[str] | None = None, min_bar
     finally:
         con.close()
     df["ts"] = pd.to_datetime(df["ts"])
-    counts = df.groupby("symbol").size()
-    df = df[df["symbol"].isin(counts[counts >= min_bars].index)]
+    df = df.sort_values(["symbol", "ts"])
+    # Data-quality screen, causal. Each bar is judged only from itself and the prior bar, so a decision on date t
+    # never depends on data after t. From a symbol's first corrupt bar onward, the symbol is cut off: its later
+    # history is dropped, so the test cannot skip a bad stock at the start and keep it afterwards.
+    # Corrupt means: a non-positive price, an inverted high/low, a high above 4x the low,
+    # or a one-day move beyond 3x / below 1/3 of the prior close (unit glitches, stale ticks).
+    # No absolute price cap: it removed high-priced rupee stocks with no corruption evidence
+    # (see data/runs/screen_evidence.md).
+    prev = df.groupby("symbol")["close"].shift(1)
+    corrupt = (
+        (df["close"] <= 0)
+        | (df["high"] < df["low"])
+        | (df["high"] > 4 * df["low"])
+        | ((prev > 0) & ((df["close"] / prev > 3) | (df["close"] / prev < 1 / 3)))
+    )
+    first_bad = df.loc[corrupt].groupby("symbol")["ts"].min()
+    cutoff = df["symbol"].map(first_bad)
+    df = df[cutoff.isna() | (df["ts"] < cutoff)]
+    bad_symbols = set(first_bad.index)
+    # No minimum-history filter over the full span: that would let future bar counts decide inclusion.
+    # Indicators stay flat during their own warm-up, so short histories simply produce no trades.
 
     wide = {c: df.pivot(index="ts", columns="symbol", values=c).sort_index() for c in ("open", "high", "low", "close")}
-    bars = {sym: g.set_index("ts")[["open", "high", "low", "close"]] for sym, g in df.groupby("symbol")}
-    return Universe(wide["open"], wide["high"], wide["low"], wide["close"], bars)
+    bars = {sym: g.set_index("ts")[["open", "high", "low", "close", "volume"]] for sym, g in df.groupby("symbol")}
+    return Universe(wide["open"], wide["high"], wide["low"], wide["close"], bars, excluded_for_quality=len(bad_symbols))
 
 
-def _panel(
-    univ: Universe, strategy: str, params: tuple[tuple[str, Any], ...], cache: dict
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Signal and rank frames (dates x symbols) for one strategy config, cached across exit rules."""
+Panel = tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]
+
+
+def _panel(univ: Universe, strategy: str, params: tuple[tuple[str, Any], ...], cache: dict) -> Panel:
+    """Signal, rank, stop and target frames (dates x symbols) for one strategy config, cached across exit rules."""
     key = (strategy, params)
     if key in cache:
         return cache[key]
-    strat = make_strategy(strategy, dict(params))
+    strat_params = dict(params)
+    breadth_min = float(strat_params.pop("breadth_min", 0.0))  # portfolio-level regime filter, not a strategy arg
+    strat = make_strategy(strategy, strat_params)
     sig: dict[str, pd.Series] = {}
     rank: dict[str, pd.Series] = {}
+    stops: dict[str, pd.Series] = {}
+    targets: dict[str, pd.Series] = {}
     for sym, bars in univ.bars.items():
         sig[sym] = strat.signal(bars)
         score = strat.rank_score(bars)
         if score is not None:
             rank[sym] = score
+        levels = strat.levels(bars)
+        if levels is not None:
+            stops[sym] = levels["stop"]
+            targets[sym] = levels["target"]
+
+    def frame(d: dict[str, pd.Series]) -> pd.DataFrame | None:
+        if not d:
+            return None
+        return pd.DataFrame(d).reindex(index=univ.opens.index, columns=univ.opens.columns)
+
     sig_df = pd.DataFrame(sig).reindex(index=univ.opens.index, columns=univ.opens.columns).fillna(0).astype(np.int8)
-    rank_df = (
-        pd.DataFrame(rank).reindex(index=univ.opens.index, columns=univ.opens.columns) if rank else None
-    )
-    cache[key] = (sig_df, rank_df)
+    if breadth_min > 0:
+        # Regime: share of the universe closing above its 200-day average. Entries only when breadth is high.
+        above = univ.closes > univ.closes.rolling(200).mean()
+        breadth = above.sum(axis=1) / univ.closes.notna().sum(axis=1).replace(0, np.nan)
+        sig_df = sig_df.mul((breadth >= breadth_min).fillna(False).astype(np.int8), axis=0).astype(np.int8)
+    cache[key] = (sig_df, frame(rank), frame(stops), frame(targets))
     return cache[key]
 
 
@@ -199,7 +267,7 @@ def simulate(
     unconstrained: bool = False,
 ) -> tuple[dict[str, float], Any, PortfolioConfig]:
     """Run one candidate on one window. Returns (metrics, result, cfg)."""
-    sig, rank = _panel(univ, cand.strategy, tuple(sorted(cand.params.items())), cache)
+    sig, rank, stops, targets = _panel(univ, cand.strategy, tuple(sorted(cand.params.items())), cache)
     cfg = cand.portfolio_cfg(base)
     if unconstrained:
         cfg = replace(cfg, max_positions=None)
@@ -212,6 +280,8 @@ def simulate(
         sig[mask],
         cfg,
         rank=rank[mask] if rank is not None else None,
+        stop_levels=stops[mask] if stops is not None else None,
+        target_levels=targets[mask] if targets is not None else None,
     )
     return portfolio_metrics(result, cfg), result, cfg
 
@@ -250,71 +320,116 @@ def _flat_metrics(results: dict[str, Any]) -> dict[str, float]:
     return flat
 
 
+def _valid_pf_key(e: dict[str, Any]) -> float:
+    pf = e["results"]["valid"]["metrics"]["profit_factor"]
+    return pf if math.isfinite(pf) else -1.0
+
+
 def log_round(
     evaluated: list[dict[str, Any]],
     *,
     settings: Settings,
     base: PortfolioConfig,
     n_symbols: int,
+    excluded_for_quality: int = 0,
     hypothesis: str,
     note: str,
     experiment: str = EXPERIMENT,
 ) -> str:
     """Log one search round: a parent run and a nested child per candidate. Returns the parent run id."""
+    """Log one search round with batched writes: one `log_batch` call per run, not one per metric.
+
+    Parent and children are created through MlflowClient, so each run costs a handful of commits
+    instead of one commit per parameter, metric or equity point.
+    """
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-    mlflow.set_experiment(experiment)
+    client = mlflow.MlflowClient()
+    exp_id = mlflow.set_experiment(experiment).experiment_id
+    now = int(time.time() * 1000)
     stamp = pd.Timestamp.now().strftime("%Y%m%d-%H%M%S")
-    with mlflow.start_run(run_name=f"round-{stamp}") as parent:
-        mlflow.set_tags(
-            {"project": "ibkr-backtest", "kind": "portfolio_search", "stage": "search", "hypothesis": hypothesis, "note": note}
-        )
-        mlflow.log_params(
-            {**base.as_params(), "n_symbols": n_symbols, "n_candidates": len(evaluated)}
-        )
-        mlflow.log_params({f"window_{w}": f"{a}..{b}" for w, (a, b) in WINDOWS.items()})
-        n_pass = sum(e["goal_met"] for e in evaluated)
-        mlflow.log_metric("candidates_passing_goal", n_pass)
 
-        rows = []
-        for e in evaluated:
-            cand: Candidate = e["candidate"]
-            with mlflow.start_run(run_name=cand.name()[:250], nested=True) as child:
-                mlflow.set_tags(
-                    {
-                        "stage": "search",
-                        "strategy": cand.strategy,
-                        "goal_met": str(e["goal_met"]).lower(),
-                        "candidate_json": cand.to_json(),
-                        "source_parent_run": parent.info.run_id,
-                    }
-                )
-                mlflow.log_params({**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold})
-                mlflow.log_metrics(_flat_metrics(e["results"]))
-                valid_eq = e["results"]["valid"]["equity"]
-                for step, (_, value) in enumerate(valid_eq.iloc[::21].items()):
-                    mlflow.log_metric("valid_equity", float(value), step=step)
-                with tempfile.TemporaryDirectory() as tmp:
-                    path = Path(tmp) / "valid_trades.csv"
-                    e["results"]["valid"]["trades"].to_csv(path, index=False)
-                    mlflow.log_artifact(str(path), artifact_path="trades")
-                rows.append(
-                    {
-                        "run_id": child.info.run_id,
-                        "candidate": cand.name(),
-                        "goal_met": e["goal_met"],
-                        **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
-                    }
-                )
+    parent_id = client.create_run(
+        exp_id,
+        run_name=f"round-{stamp}",
+        tags={
+            "project": "ibkr-backtest",
+            "kind": "portfolio_search",
+            "stage": "search",
+            "hypothesis": hypothesis,
+            "note": note,
+        },
+    ).info.run_id
+    round_params = {
+        **base.as_params(),
+        "n_symbols": n_symbols,
+        "excluded_for_quality": excluded_for_quality,
+        "n_candidates": len(evaluated),
+    }
+    round_params.update({f"window_{w}": f"{a}..{b}" for w, (a, b) in WINDOWS.items()})
+    client.log_batch(
+        parent_id,
+        params=[Param(k, str(v)) for k, v in round_params.items()],
+        metrics=[Metric("candidates_passing_goal", float(sum(e["goal_met"] for e in evaluated)), now, 0)],
+    )
 
-        leaderboard = pd.DataFrame(rows).sort_values(
-            ["goal_met", "valid_profit_factor"], ascending=[False, False]
+    # Heavy artifacts (equity curve, trade list) only for the top 10 by validation PF.
+    top_ids = {id(e) for e in sorted(evaluated, key=_valid_pf_key, reverse=True)[:10]}
+    rows = []
+    for e in evaluated:
+        cand: Candidate = e["candidate"]
+        child_id = client.create_run(
+            exp_id,
+            run_name=cand.name()[:250],
+            tags={
+                MLFLOW_PARENT_RUN_ID: parent_id,
+                "stage": "search",
+                "strategy": cand.strategy,
+                "goal_met": str(e["goal_met"]).lower(),
+                "candidate_json": cand.to_json(),
+                "source_parent_run": parent_id,
+            },
+        ).info.run_id
+        metrics = [Metric(k, v, now, 0) for k, v in _flat_metrics(e["results"]).items()]
+        params = {**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold}
+        if id(e) in top_ids:
+            valid_eq = e["results"]["valid"]["equity"].iloc[::21]
+            metrics += [Metric("valid_equity", float(v), now, step) for step, v in enumerate(valid_eq.to_numpy())]
+        client.log_batch(
+            child_id,
+            metrics=metrics[:1000],
+            params=[Param(k, str(v)) for k, v in params.items()],
         )
-        mlflow.log_table(leaderboard, artifact_file="leaderboard.json")
-        if not leaderboard.empty:
-            best = leaderboard.iloc[0]
-            mlflow.log_metric("best_valid_profit_factor", float(best["valid_profit_factor"]))
-            mlflow.log_metric("best_valid_win_rate", float(best["valid_win_rate"]))
-        return parent.info.run_id
+        if id(e) in top_ids:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "valid_trades.csv"
+                e["results"]["valid"]["trades"].to_csv(path, index=False)
+                client.log_artifact(child_id, str(path), artifact_path="trades")
+        client.set_terminated(child_id)
+        rows.append(
+            {
+                "run_id": child_id,
+                "candidate": cand.name(),
+                "goal_met": e["goal_met"],
+                **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
+            }
+        )
+
+    leaderboard = pd.DataFrame(rows).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "leaderboard.csv"
+        leaderboard.to_csv(path, index=False)
+        client.log_artifact(parent_id, str(path))
+    if not leaderboard.empty:
+        best = leaderboard.iloc[0]
+        client.log_batch(
+            parent_id,
+            metrics=[
+                Metric("best_valid_profit_factor", float(best["valid_profit_factor"]), now, 0),
+                Metric("best_valid_win_rate", float(best["valid_win_rate"]), now, 0),
+            ],
+        )
+    client.set_terminated(parent_id)
+    return parent_id
 
 
 LEADERBOARD_COLS = [
@@ -331,6 +446,18 @@ LEADERBOARD_COLS = [
 ]
 
 
+# Shared with forked worker processes (copy-on-write), so the universe is loaded once.
+_UNIV: Universe | None = None
+_BASE: PortfolioConfig | None = None
+
+
+def _eval_group(cands: list[Candidate]) -> list[dict[str, Any]]:
+    """Evaluate every exit variant of one strategy config. The signal panel is computed once per group."""
+    assert _UNIV is not None and _BASE is not None
+    cache: dict = {}
+    return [evaluate(_UNIV, c, _BASE, cache) for c in cands]
+
+
 def search(
     db_path: str | Path,
     settings: Settings,
@@ -341,27 +468,42 @@ def search(
     symbols: list[str] | None = None,
     strategies: list[str] | None = None,
     experiment: str = EXPERIMENT,
+    workers: int | None = None,
+    exit_grid: dict[str, list[Any]] = EXIT_GRID,
 ) -> tuple[str, pd.DataFrame]:
+    global _UNIV, _BASE
     univ = load_universe(db_path, symbols)
-    cands = expand_candidates(strategies=strategies)
-    cache: dict = {}
-    evaluated = []
-    for k, cand in enumerate(cands, 1):
-        evaluated.append(evaluate(univ, cand, base, cache))
-        if k % 10 == 0:
-            print(f"{k}/{len(cands)} candidates", flush=True)
+    _UNIV, _BASE = univ, base
+    cands = expand_candidates(strategies=strategies, exit_grid=exit_grid)
+    groups: dict[tuple, list[Candidate]] = {}
+    for cand in cands:
+        groups.setdefault((cand.strategy, cand.strategy_params), []).append(cand)
+
+    evaluated: list[dict[str, Any]] = []
+    # Each worker holds its own pandas copies of the universe, so memory bounds the worker count (7 GB RAM here).
+    default_workers = int(os.getenv("IBBT_WORKERS", str(os.cpu_count() or 1)))
+    n_workers = min(workers or default_workers, len(groups))
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("fork")) as pool:
+        for k, group_result in enumerate(pool.map(_eval_group, groups.values()), 1):
+            evaluated.extend(group_result)
+            print(f"{k}/{len(groups)} strategy configs ({len(evaluated)}/{len(cands)} candidates)", flush=True)
     run_id = log_round(
         evaluated,
         settings=settings,
         base=base,
         n_symbols=univ.n_symbols,
+        excluded_for_quality=univ.excluded_for_quality,
         hypothesis=hypothesis,
         note=note,
         experiment=experiment,
     )
     table = pd.DataFrame(
         [
-            {"candidate": e["candidate"].name(), "goal_met": e["goal_met"], **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS}}
+            {
+                "candidate": e["candidate"].name(),
+                "goal_met": e["goal_met"],
+                **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
+            }
             for e in evaluated
         ]
     ).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
@@ -398,9 +540,17 @@ def run_holdout(
                 "strategy": cand.strategy,
             }
         )
-        mlflow.log_params({**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold})
+        mlflow.log_params(
+            {**cand.params, "stop_pct": cand.stop_pct, "target_pct": cand.target_pct, "max_hold": cand.max_hold}
+        )
         mlflow.log_metrics({f"holdout_{k}": v for k, v in metrics.items() if not (math.isnan(v) or math.isinf(v))})
-        mlflow.log_metrics({f"holdout_pooled_{k}": v for k, v in pooled.items() if k in ("profit_factor", "win_rate", "round_trips") and not (math.isnan(v) or math.isinf(v))})
+        mlflow.log_metrics(
+            {
+                f"holdout_pooled_{k}": v
+                for k, v in pooled.items()
+                if k in ("profit_factor", "win_rate", "round_trips") and not (math.isnan(v) or math.isinf(v))
+            }
+        )
         mlflow.set_tag("goal_met_holdout", str(passes_goal(metrics)).lower())
         for step, (_, value) in enumerate(result.equity.iloc[::21].items()):
             mlflow.log_metric("holdout_equity", float(value), step=step)

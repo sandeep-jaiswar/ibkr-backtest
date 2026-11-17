@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import re
 import asyncio
 import itertools
+import re
 import sys
 from datetime import date, timedelta
 from typing import Any
@@ -88,7 +88,19 @@ def _cfg(args: argparse.Namespace) -> BacktestConfig:
 def cmd_fetch(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     with Store(settings.duckdb_path) as store:
-        asyncio.run(_backfill(settings, store, args.symbols, args.start, args.end, args.exchange, args.currency))
+        asyncio.run(
+            _backfill(
+                settings,
+                store,
+                args.symbols,
+                args.start,
+                args.end,
+                args.exchange,
+                args.currency,
+                concurrency=args.concurrency,
+                key_prefix=args.key_prefix,
+            )
+        )
     return 0
 
 
@@ -101,6 +113,7 @@ async def _backfill(
     exchange: str,
     currency: str,
     concurrency: int = 4,
+    key_prefix: str = "",
 ) -> dict[str, list]:
     """Fetch symbols with up to `concurrency` requests in flight on one IB connection.
 
@@ -119,15 +132,16 @@ async def _backfill(
                     summary["interrupted"].append(symbol)
                     return
                 try:
-                    gaps = ib_source.missing_ranges(store.coverage(symbol), start, end)
+                    key = key_prefix + symbol  # stored key; the IB contract still uses the plain symbol
+                    gaps = ib_source.missing_ranges(store.coverage(key), start, end)
                     if not gaps:
                         summary["covered"].append(symbol)
                         return
                     written_total = 0
                     for gap_start, gap_end in gaps:
                         bars = await ib_source.fetch_daily_bars(ib, symbol, gap_start, gap_end, exchange, currency)
-                        written = store.upsert_bars(symbol, bars)
-                        store.log_fetch(symbol=symbol, start=gap_start, end=gap_end, rows=written, source="IB")
+                        written = store.upsert_bars(key, bars)
+                        store.log_fetch(symbol=key, start=gap_start, end=gap_end, rows=written, source="IB")
                         written_total += written
                     summary["stored" if written_total else "empty"].append(symbol)
                     print(f"{symbol}: stored {written_total} bars", flush=True)
@@ -160,9 +174,7 @@ def cmd_ingest_universe(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     with Store(settings.duckdb_path) as store:
         summary = asyncio.run(
-            _backfill(
-                settings, store, symbols, args.start, args.end, args.exchange, args.currency, args.concurrency
-            )
+            _backfill(settings, store, symbols, args.start, args.end, args.exchange, args.currency, args.concurrency)
         )
     failed = pd.DataFrame(summary["failed"], columns=["symbol", "error"])
     failed.to_csv(args.failures_out, index=False)
@@ -218,9 +230,12 @@ def cmd_search(args: argparse.Namespace) -> int:
     results = run_search(str(settings.duckdb_path), args.split, symbols=args.symbols, cfg=cfg)
     results["pass_is"] = passes(results, "is")
     results["pass_oos"] = passes(results, "oos")
-    n = len(args.symbols) if args.symbols else int(
-        duckdb.connect(str(settings.duckdb_path), read_only=True).sql("select count(distinct symbol) from bars").fetchone()[0]
-    )
+    if args.symbols:
+        n = len(args.symbols)
+    else:
+        con = duckdb.connect(str(settings.duckdb_path), read_only=True)
+        n = int(con.execute("select count(distinct symbol) from bars").fetchone()[0])
+        con.close()
     run_id = log_search(results, settings=settings, split=args.split, n_symbols=n, cfg=cfg, experiment_note=args.note)
     print(results.sort_values("is_profit_factor", ascending=False).head(10).to_string(index=False))
     print(
@@ -331,7 +346,7 @@ def _add_portfolio_args(p: argparse.ArgumentParser) -> None:
 
 
 def cmd_portfolio_search(args: argparse.Namespace) -> int:
-    from ibbt.portfolio_search import GOAL, LEADERBOARD_COLS, search
+    from ibbt.portfolio_search import EXIT_GRID, EXIT_PRESETS, GOAL, LEADERBOARD_COLS, search
 
     settings = Settings.from_env()
     run_id, table = search(
@@ -342,6 +357,7 @@ def cmd_portfolio_search(args: argparse.Namespace) -> int:
         note=args.note,
         symbols=args.symbols,
         strategies=args.strategies,
+        exit_grid=EXIT_PRESETS.get(args.exit_preset, EXIT_GRID),
     )
     cols = ["candidate", "goal_met", *LEADERBOARD_COLS]
     print(table[cols].head(args.top).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
@@ -387,6 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--end", type=date.fromisoformat, default=date.today() - timedelta(days=1))
     p.add_argument("--exchange", default="SMART")
     p.add_argument("--currency", default="USD")
+    p.add_argument("--key-prefix", default="", help="prefix for stored symbols, e.g. NSE: (avoids clashes)")
+    p.add_argument("--concurrency", type=int, default=4, help="symbols in flight at once (IB pacing applies)")
     p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("ingest-universe", help="fetch daily bars for every ticker in the membership file")
@@ -417,6 +435,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="")
     p.add_argument("--symbols", nargs="*", help="default: every symbol with enough history")
     p.add_argument("--strategies", nargs="*", choices=sorted(REGISTRY), help="default: all with a grid")
+    p.add_argument(
+        "--exit-preset", choices=["r1", "r2"], default="r2", help="r1 tight exits, r2 wide exits + time stops"
+    )
     p.add_argument("--top", type=int, default=15, help="rows to print")
     p.set_defaults(func=cmd_portfolio_search)
 
