@@ -31,6 +31,7 @@ CONFIGS = {
     "adaptive_vidya": {},
     "adaptive_supersmoother": {},
     "adx_lifecycle_trail": {},
+    "kaufman_adaptive_channel": {},
     "double_smoothed_mad": {"source": "close", "momentum_len": 1, "smooth1": 1, "smooth2": 20, "mad_len": 29, "mad_mult": 1.0},
     "dual_ma_sd_oscillator": {"source": "close", "fast_len": 1, "slow_len": 30, "smooth_len": 1, "upper_sd_len": 25, "lower_sd_len": 25},
     "projected_crossover": {"source": "close", "fast_len": 10, "slow_len": 30, "smooth_len": 5},

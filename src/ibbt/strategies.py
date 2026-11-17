@@ -2016,6 +2016,200 @@ class AdxLifecycleTrail(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class KaufmanAdaptiveChannel(Strategy):
+    """Port of the Pine script "Kaufman Adaptive Channel Trend" (SchizoQuant), as a long/flat strategy.
+
+    Efficiency ratio ER = |src - src[er_len]| / sum of |src[i] - src[i+1]| over er_len bars, clamped to [0, 1].
+    SC = (ER * (fast_sc - slow_sc) + slow_sc)^2, with fast_sc = 2/(fast+1) and slow_sc = 2/(slow+1)
+    (the two lengths are sorted first). KAMA = KAMA[1] + SC * (src - KAMA[1]), re-seeded from src when NaN.
+    Band distance = max(RMS(src - KAMA, band_len) * band_mult, ATR(atr_len) * band_floor), with RMA of the squared
+    residual; NaN warm-up falls back to the current residual and current true range.
+    Price channel: highest high / lowest low over channel_len bars, one bar late (nz falls back to the current bar).
+    Structure weight = min(ER * structure_influence, 1); defence = (1 - w) * band + w * channel.
+    Bullish defence = (1 - w) * lower band + w * channel low; bearish = (1 - w) * upper band + w * channel high.
+    Trail: bullish regime trail = max(previous trail, bullish defence); bearish = min(previous trail, bearish defence).
+    Flip: src > trail sets bullish; src < trail sets bearish. A flip resets the trail to src -/+ reset distance,
+    where reset = max(ATR * reset_atr, band distance).
+    Regime starts bullish (`var int SQ = src >= kama ? 1 : -1` on the first bar).
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    `mintick` stands in for Pine's syminfo.mintick.
+    """
+
+    name = "kaufman_adaptive_channel"
+
+    def __init__(
+        self,
+        source: str = "close",
+        er_len: int = 14,
+        fast_len: int = 2,
+        slow_len: int = 30,
+        band_len: int = 20,
+        band_mult: float = 2.0,
+        band_floor: float = 0.7,
+        channel_len: int = 22,
+        structure_influence: float = 1.25,
+        atr_len: int = 14,
+        reset_atr: float = 1.5,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("kaufman_adaptive_channel source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.er_len = int(er_len)
+        self.fast_len = int(fast_len)
+        self.slow_len = int(slow_len)
+        self.band_len = int(band_len)
+        self.band_mult = float(band_mult)
+        self.band_floor = float(band_floor)
+        self.channel_len = int(channel_len)
+        self.structure_influence = float(structure_influence)
+        self.atr_len = int(atr_len)
+        self.reset_atr = float(reset_atr)
+        self.mintick = float(mintick)
+        if self.er_len < 2 or self.fast_len < 1 or self.slow_len < 2 or self.band_len < 2:
+            raise ValueError("kaufman_adaptive_channel: er_len >= 2, fast_len >= 1, slow_len >= 2, band_len >= 2")
+        if self.channel_len < 2 or self.atr_len < 1:
+            raise ValueError("kaufman_adaptive_channel: channel_len >= 2 and atr_len >= 1")
+        if self.band_mult < 0.1 or self.band_floor < 0.0 or self.reset_atr < 0.1:
+            raise ValueError("kaufman_adaptive_channel: band_mult >= 0.1, band_floor >= 0, reset_atr >= 0.1")
+        if not 0.0 <= self.structure_influence <= 2.0 or self.mintick <= 0:
+            raise ValueError("kaufman_adaptive_channel: structure_influence in [0, 2] and mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "er_len": self.er_len,
+            "fast_len": self.fast_len,
+            "slow_len": self.slow_len,
+            "band_len": self.band_len,
+            "band_mult": self.band_mult,
+            "band_floor": self.band_floor,
+            "channel_len": self.channel_len,
+            "structure_influence": self.structure_influence,
+            "atr_len": self.atr_len,
+            "reset_atr": self.reset_atr,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
+        src_s = self._source(bars)
+        s = src_s.to_numpy()
+        h = bars["high"].astype(float)
+        lo = bars["low"].astype(float)
+        c = bars["close"].astype(float)
+        hv, lv = h.to_numpy(), lo.to_numpy()
+        n = len(s)
+
+        def filled(k: int) -> np.ndarray:
+            arr = _shift(s, k)
+            return np.where(np.isnan(arr), s, arr)
+
+        net = np.abs(s - filled(self.er_len))
+        total = np.zeros(n)
+        for i in range(self.er_len):
+            total += np.abs(filled(i) - filled(i + 1))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            er = np.where(total > 0.0, net / total, 0.0)
+        er = np.maximum(0.0, np.minimum(1.0, er))
+
+        eff_fast, eff_slow = min(self.fast_len, self.slow_len), max(self.fast_len, self.slow_len)
+        fast_sc = 2.0 / (eff_fast + 1.0)
+        slow_sc = 2.0 / (eff_slow + 1.0)
+        adaptive_sc = er * (fast_sc - slow_sc) + slow_sc
+        sc = adaptive_sc * adaptive_sc
+
+        kama = np.full(n, np.nan)
+        prev = np.nan
+        for t in range(n):
+            cur = s[t] if np.isnan(prev) else prev + sc[t] * (s[t] - prev)
+            kama[t] = cur
+            prev = cur
+
+        pc = c.shift(1)
+        tr = pd.concat([h - lo, (h - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1).to_numpy()
+        tr[0] = hv[0] - lv[0]
+        atr_raw = _rma(tr, self.atr_len)
+        atr = np.maximum(np.where(np.isnan(atr_raw), tr, atr_raw), self.mintick)
+
+        resid = s - kama
+        resid_sq = resid * resid
+        power = _rma(resid_sq, self.band_len)
+        rms = np.sqrt(np.maximum(np.where(np.isnan(power), resid_sq, power), 0.0))
+        band_dist = np.maximum(rms * self.band_mult, atr * self.band_floor)
+        upper = kama + band_dist
+        lower = kama - band_dist
+
+        ch_hi = pd.Series(hv).rolling(self.channel_len).max().shift(1).to_numpy()
+        ch_lo = pd.Series(lv).rolling(self.channel_len).min().shift(1).to_numpy()
+        channel_upper = np.where(np.isnan(ch_hi), hv, ch_hi)
+        channel_lower = np.where(np.isnan(ch_lo), lv, ch_lo)
+
+        struct_w = np.minimum(er * self.structure_influence, 1.0)
+        band_w = 1.0 - struct_w
+        return {
+            "src": s,
+            "kama": kama,
+            "er": er,
+            "struct_w": struct_w,
+            "band_w": band_w,
+            "band_dist": band_dist,
+            "atr": atr,
+            "upper": upper,
+            "lower": lower,
+            "channel_upper": channel_upper,
+            "channel_lower": channel_lower,
+        }
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        lv = self._levels(bars)
+        s = lv["src"]
+        bull_def = lv["band_w"] * lv["lower"] + lv["struct_w"] * lv["channel_lower"]
+        bear_def = lv["band_w"] * lv["upper"] + lv["struct_w"] * lv["channel_upper"]
+        reset = np.maximum(lv["atr"] * self.reset_atr, lv["band_dist"])
+        n = len(s)
+
+        out = np.zeros(n, dtype=int)
+        sq = 1 if s[0] >= lv["kama"][0] else -1  # `var int SQ`, set on the first bar
+        trail = np.nan
+        for t in range(n):
+            prev_sq = sq
+            if trail == trail:
+                prev_trail = trail
+            else:
+                prev_trail = s[t] - reset[t] if prev_sq == 1 else s[t] + reset[t]
+
+            if prev_sq == 1:
+                trail_t = _nmax(prev_trail, bull_def[t])
+            else:
+                trail_t = _nmin(prev_trail, bear_def[t])
+            trail = trail_t
+
+            is_long = prev_sq == -1 and s[t] > trail_t
+            is_short = prev_sq == 1 and s[t] < trail_t
+            if is_long:
+                sq = 1
+                trail = s[t] - reset[t]
+            elif is_short:
+                sq = -1
+                trail = s[t] + reset[t]
+            else:
+                sq = prev_sq
+            out[t] = int(sq == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -2039,6 +2233,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         AdaptiveVidya,
         AdaptiveSuperSmoother,
         AdxLifecycleTrail,
+        KaufmanAdaptiveChannel,
     )
 }
 
