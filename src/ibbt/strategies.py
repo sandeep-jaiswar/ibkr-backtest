@@ -2365,6 +2365,330 @@ class AdaptiveBreakoutOscillator(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class EhlersInstantTrend(Strategy):
+    """Port of the Pine script "Ehlers Instant Trend" (SchizoQuant), as a long/flat strategy.
+
+    Instantaneous trendline (Ehlers, 2-pole): for bars 0-6 it equals the seed (src + 2 src[1] + src[2]) / 4;
+    after that, it = c0 src + c1 src[1] + c2 src[2] + c3 it[1] + c4 it[2] with the alpha-dependent coefficients
+    from the script. Trigger = 2 it - it[2]; momentum = trigger - it.
+    Defence distance = max(RMS(src - it, noise_len) * band_mult, ATR(atr_len) * min_atr).
+    Bullish boundary = it - distance; bearish boundary = it + distance.
+    Trail: bullish = max(previous trail, bullish boundary); bearish = min(previous trail, bearish boundary).
+    Bullish flip: prior regime bearish, src > trail, and (momentum > 0 or src > it + ATR * reversal).
+    Bearish flip: prior regime bullish, src < trail, and (momentum < 0 or src < it - ATR * reversal).
+    On a flip the trail is set to min(bullish boundary, src - min distance) or max(bearish boundary, src + min distance).
+    Regime starts bullish when src >= it on the first bar. Long while the regime is +1, flat otherwise.
+    The engine trades the next open. Only past and present bars are used. `mintick` stands in for syminfo.mintick.
+    """
+
+    name = "ehlers_instant_trend"
+
+    def __init__(
+        self,
+        source: str = "close",
+        alpha: float = 0.12,
+        noise_len: int = 20,
+        band_mult: float = 2.7,
+        atr_len: int = 14,
+        min_atr: float = 0.8,
+        reversal: float = 0.5,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("ehlers_instant_trend source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.alpha = float(alpha)
+        self.noise_len = int(noise_len)
+        self.band_mult = float(band_mult)
+        self.atr_len = int(atr_len)
+        self.min_atr = float(min_atr)
+        self.reversal = float(reversal)
+        self.mintick = float(mintick)
+        if not 0.02 <= self.alpha <= 0.5:
+            raise ValueError("ehlers_instant_trend alpha must be in [0.02, 0.5]")
+        if self.noise_len < 2 or self.atr_len < 1:
+            raise ValueError("ehlers_instant_trend needs noise_len >= 2 and atr_len >= 1")
+        if self.band_mult < 0.2 or self.min_atr < 0.1 or self.reversal < 0.0 or self.mintick <= 0:
+            raise ValueError("ehlers_instant_trend: band_mult >= 0.2, min_atr >= 0.1, reversal >= 0, mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "alpha": self.alpha,
+            "noise_len": self.noise_len,
+            "band_mult": self.band_mult,
+            "atr_len": self.atr_len,
+            "min_atr": self.min_atr,
+            "reversal": self.reversal,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
+        src_s = self._source(bars)
+        s = src_s.to_numpy()
+        n = len(s)
+
+        def filled(k: int) -> np.ndarray:
+            arr = _shift(s, k)
+            return np.where(np.isnan(arr), s, arr)
+
+        a = self.alpha
+        a2 = a * a
+        c0 = a - 0.25 * a2
+        c1 = 0.50 * a2
+        c2 = -(a - 0.75 * a2)
+        c3 = 2.0 * (1.0 - a)
+        c4 = -(1.0 - a) * (1.0 - a)
+
+        seed = (s + 2.0 * filled(1) + filled(2)) / 4.0
+        it = np.full(n, np.nan)
+        for t in range(n):
+            if t < 7:  # `if bar_index < 7`
+                it[t] = seed[t]
+            else:
+                p1 = it[t - 1] if not np.isnan(it[t - 1]) else seed[t]
+                p2 = it[t - 2] if not np.isnan(it[t - 2]) else seed[t]
+                it[t] = c0 * s[t] + c1 * filled(1)[t] + c2 * filled(2)[t] + c3 * p1 + c4 * p2
+
+        trigger = 2.0 * it - np.where(np.isnan(_shift(it, 2)), it, _shift(it, 2))
+        momentum = trigger - it
+
+        resid = s - it
+        resid_sq = resid * resid
+        power = _rma(resid_sq, self.noise_len)
+        rms = np.sqrt(np.maximum(np.where(np.isnan(power), resid_sq, power), 0.0))
+
+        bars_h = bars["high"].astype(float).to_numpy()
+        bars_l = bars["low"].astype(float).to_numpy()
+        prev_c = _shift(bars["close"].astype(float).to_numpy(), 1)
+        tr = np.fmax(bars_h - bars_l, np.fmax(np.abs(bars_h - prev_c), np.abs(bars_l - prev_c)))
+        tr[0] = bars_h[0] - bars_l[0]  # no previous close on the first bar
+        atr_raw = _rma(tr, self.atr_len)
+        atr = np.maximum(np.where(np.isnan(atr_raw), tr, atr_raw), self.mintick)
+
+        defense = np.maximum(rms * self.band_mult, atr * self.min_atr)
+        return {
+            "src": s,
+            "it": it,
+            "momentum": momentum,
+            "atr": atr,
+            "defense": defense,
+            "bull_b": it - defense,
+            "bear_b": it + defense,
+            "min_dist": atr * self.min_atr,
+        }
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        lv = self._levels(bars)
+        s, it, mom, atr = lv["src"], lv["it"], lv["momentum"], lv["atr"]
+        defense, bull_b, bear_b, min_dist = lv["defense"], lv["bull_b"], lv["bear_b"], lv["min_dist"]
+        n = len(s)
+
+        out = np.zeros(n, dtype=int)
+        sq = 1 if s[0] >= it[0] else -1  # `var int SQ = src >= instantTrend ? 1 : -1`
+        trail = np.nan
+        for t in range(n):
+            prev_sq = sq
+            if trail == trail:
+                prev_trail = trail
+            else:
+                prev_trail = s[t] - defense[t] if prev_sq == 1 else s[t] + defense[t]
+
+            if prev_sq == 1:
+                trail = _nmax(prev_trail, bull_b[t])
+            else:
+                trail = _nmin(prev_trail, bear_b[t])
+
+            bearish_mom = mom[t] < 0.0
+            bullish_mom = mom[t] > 0.0
+            strong_bear = s[t] < it[t] - atr[t] * self.reversal
+            strong_bull = s[t] > it[t] + atr[t] * self.reversal
+            is_short = prev_sq == 1 and s[t] < trail and (bearish_mom or strong_bear)
+            is_long = prev_sq == -1 and s[t] > trail and (bullish_mom or strong_bull)
+
+            if is_long:
+                sq = 1
+                trail = min(bull_b[t], s[t] - min_dist[t])
+            elif is_short:
+                sq = -1
+                trail = max(bear_b[t], s[t] + min_dist[t])
+            else:
+                sq = prev_sq
+            out[t] = int(sq == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
+def _decycler(price: np.ndarray, period: int) -> np.ndarray:
+    """Ehlers two-pole decycler, as in the script: price minus its high-pass part.
+
+    The high-pass uses the script's own coefficients and is zero for bars 0 and 1 (bar_index >= 2 guard).
+    """
+    angle = 0.707 * 2.0 * np.pi / period
+    alpha = (np.cos(angle) + np.sin(angle) - 1.0) / np.cos(angle)
+    decay = 1.0 - alpha
+    gain = (1.0 - alpha * 0.5) ** 2
+    n = len(price)
+    hp = np.zeros(n)
+    out = np.zeros(n)
+    for t in range(n):
+        if t >= 2:
+            h1 = hp[t - 1]
+            h2 = hp[t - 2]
+            hp[t] = gain * (price[t] - 2.0 * price[t - 1] + price[t - 2]) + 2.0 * decay * h1 - decay * decay * h2
+        out[t] = price[t] - hp[t]
+    return out
+
+
+class DecyclerHighLowBreakout(Strategy):
+    """Port of the Pine script "Decycler High-Low Breakout" (SchizoQuant), as a long/flat strategy.
+
+    Decycler applied to high, low and close (two-pole high-pass, `period` cutoff). Channel = [min, max] of the three.
+    ATR(atr_len) falls back to the tick size while NaN (as safeATR does, not the true range).
+    Normalized slope = (decycler close - its value slope_len bars ago) / (safeATR * sqrt(slope_len)).
+    Padding = safeATR * padding * (1 + breathing * strength), strength = clamp(+/- slope, 0, 2) on each side.
+    Lower defence = channel low - bullish padding; upper defence = channel high + bearish padding.
+    Breakouts: close below the lower defence, with a negative slope beyond slope_conf or a close below
+    lower defence - override * ATR, flips bearish. Mirror image flips bullish.
+    The regime is flat (SQ = 0) until the warm-up of max(period, atr_len, slope_len) bars is complete and
+    ATR and the slope are defined. The first ready bar sets it from close vs the decycler close.
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    `mintick` stands in for syminfo.mintick.
+    """
+
+    name = "decycler_hl_breakout"
+
+    def __init__(
+        self,
+        source: str = "close",
+        period: int = 115,
+        atr_len: int = 14,
+        padding: float = 0.1,
+        slope_len: int = 3,
+        slope_conf: float = 0.05,
+        breathing: float = 0.5,
+        override: float = 0.45,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("decycler_hl_breakout source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.period = int(period)
+        self.atr_len = int(atr_len)
+        self.padding = float(padding)
+        self.slope_len = int(slope_len)
+        self.slope_conf = float(slope_conf)
+        self.breathing = float(breathing)
+        self.override = float(override)
+        self.mintick = float(mintick)
+        if self.period < 6 or self.atr_len < 1 or self.slope_len < 1:
+            raise ValueError("decycler_hl_breakout needs period >= 6, atr_len >= 1, slope_len >= 1")
+        if not 0.0 <= self.padding <= 3.0 or not 0.0 <= self.slope_conf <= 1.0:
+            raise ValueError("decycler_hl_breakout: padding in [0, 3], slope_conf in [0, 1]")
+        if not 0.0 <= self.breathing <= 2.0 or not 0.0 <= self.override <= 3.0 or self.mintick <= 0:
+            raise ValueError("decycler_hl_breakout: breathing in [0, 2], override in [0, 3], mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "period": self.period,
+            "atr_len": self.atr_len,
+            "padding": self.padding,
+            "slope_len": self.slope_len,
+            "slope_conf": self.slope_conf,
+            "breathing": self.breathing,
+            "override": self.override,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def _levels(self, bars: pd.DataFrame) -> dict[str, np.ndarray]:
+        hv = bars["high"].astype(float).to_numpy()
+        lv = bars["low"].astype(float).to_numpy()
+        cv = bars["close"].astype(float).to_numpy()
+        n = len(cv)
+        tick = self.mintick
+
+        d_h = _decycler(hv, self.period)
+        d_l = _decycler(lv, self.period)
+        d_c = _decycler(cv, self.period)
+        upper_ch = np.maximum(d_h, np.maximum(d_l, d_c))
+        lower_ch = np.minimum(d_h, np.minimum(d_l, d_c))
+
+        prev_c = _shift(cv, 1)
+        tr = np.fmax(hv - lv, np.fmax(np.abs(hv - prev_c), np.abs(lv - prev_c)))
+        tr[0] = hv[0] - lv[0]
+        atr = _rma(tr, self.atr_len)  # NaN until seeded, as ta.atr is
+        safe_atr = np.maximum(np.where(np.isnan(atr), tick, atr), tick)
+
+        slope = d_c - _shift(d_c, self.slope_len)
+        norm = slope / (safe_atr * np.sqrt(float(self.slope_len)))
+        bull_s = np.minimum(np.maximum(norm, 0.0), 2.0)
+        bear_s = np.minimum(np.maximum(-norm, 0.0), 2.0)
+
+        bull_pad = safe_atr * self.padding * (1.0 + self.breathing * bull_s)
+        bear_pad = safe_atr * self.padding * (1.0 + self.breathing * bear_s)
+        lower_def = lower_ch - bull_pad
+        upper_def = upper_ch + bear_pad
+        bear_brk_lvl = lower_def - safe_atr * self.override
+        bull_brk_lvl = upper_def + safe_atr * self.override
+
+        bearish_slope = norm < -self.slope_conf
+        bullish_slope = norm > self.slope_conf
+        bearish_break = (cv < lower_def) & (bearish_slope | (cv < bear_brk_lvl))
+        bullish_break = (cv > upper_def) & (bullish_slope | (cv > bull_brk_lvl))
+
+        warmup = max(self.period, self.atr_len, self.slope_len)
+        ready = (np.arange(n) >= warmup) & ~np.isnan(atr) & ~np.isnan(norm)
+        return {
+            "close": cv,
+            "d_c": d_c,
+            "bearish_break": bearish_break,
+            "bullish_break": bullish_break,
+            "ready": ready,
+        }
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        lv = self._levels(bars)
+        cv, d_c = lv["close"], lv["d_c"]
+        brk_bear, brk_bull, ready = lv["bearish_break"], lv["bullish_break"], lv["ready"]
+
+        out = np.zeros(len(cv), dtype=int)
+        sq = 0  # `var int SQ = 0`
+        for t in range(len(cv)):
+            if ready[t]:
+                if sq == 0:
+                    sq = 1 if cv[t] >= d_c[t] else -1
+                elif sq == -1 and brk_bull[t]:
+                    sq = 1
+                elif sq == 1 and brk_bear[t]:
+                    sq = -1
+            out[t] = int(sq == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -2390,6 +2714,8 @@ REGISTRY: dict[str, type[Strategy]] = {
         AdxLifecycleTrail,
         KaufmanAdaptiveChannel,
         AdaptiveBreakoutOscillator,
+        EhlersInstantTrend,
+        DecyclerHighLowBreakout,
     )
 }
 

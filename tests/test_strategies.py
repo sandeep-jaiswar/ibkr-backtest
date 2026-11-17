@@ -551,3 +551,62 @@ def test_adaptive_breakout_oscillator_rejects_bad_params():
         AdaptiveBreakoutOscillator(short_len=20, medium_len=10)
     with pytest.raises(ValueError):
         AdaptiveBreakoutOscillator(max_threshold=1.5)
+
+
+def test_ehlers_instant_trend_regimes():
+    """Starts bullish, follows a rally, and flips flat on a sustained selloff with negative momentum."""
+    import numpy as np
+    from ibbt.strategies import EhlersInstantTrend
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = EhlersInstantTrend().signal(bars)
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_ehlers_instant_trend_seed_during_first_bars():
+    import numpy as np
+    from ibbt.strategies import EhlersInstantTrend
+
+    idx = pd.bdate_range("2020-01-01", periods=12)
+    close = np.arange(100.0, 112.0)
+    bars = pd.DataFrame({"open": close, "high": close, "low": close, "close": close, "volume": 1.0}, index=idx)
+    lv = EhlersInstantTrend()._levels(bars)
+    # For bars 0-6 the trendline is the seed (src + 2 src[1] + src[2]) / 4; on a line that is src[t] - 1.
+    assert lv["it"][3] == pytest.approx((103 + 2 * 102 + 101) / 4)
+
+
+def test_ehlers_instant_trend_rejects_bad_params():
+    from ibbt.strategies import EhlersInstantTrend
+
+    with pytest.raises(ValueError):
+        EhlersInstantTrend(alpha=0.9)
+    with pytest.raises(ValueError):
+        EhlersInstantTrend(noise_len=1)
+
+
+def test_decycler_hl_breakout_stays_flat_during_warmup_and_follows_trend():
+    """The regime is flat until the 115-bar warm-up is complete, then goes long on a sustained rally and flat on a crash."""
+    import numpy as np
+    from ibbt.strategies import DecyclerHighLowBreakout
+
+    n = 460
+    idx = pd.bdate_range("2019-01-01", periods=n)
+    close = np.r_[np.linspace(100, 200, 200), np.linspace(200, 80, 260)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = DecyclerHighLowBreakout().signal(bars)
+    assert sig.iloc[:115].sum() == 0
+    assert sig.iloc[180:200].sum() > 0
+    assert sig.iloc[-1] == 0
+
+
+def test_decycler_hl_breakout_rejects_bad_params():
+    from ibbt.strategies import DecyclerHighLowBreakout
+
+    with pytest.raises(ValueError):
+        DecyclerHighLowBreakout(period=3)
+    with pytest.raises(ValueError):
+        DecyclerHighLowBreakout(slope_conf=2.0)
