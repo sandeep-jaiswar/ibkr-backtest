@@ -23,6 +23,20 @@ class Strategy(ABC):
     def params(self) -> dict[str, Any]:
         return {}
 
+    def rank_score(self, bars: pd.DataFrame) -> pd.Series | None:
+        """Optional tie-break for portfolio runs when more signals fire than free slots.
+
+        Lower score = higher priority. Must only use data up to the bar's close.
+        """
+        return None
+
+
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    return (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(100.0)
+
 
 class BuyAndHold(Strategy):
     name = "buy_and_hold"
@@ -131,12 +145,13 @@ class RsiPullback(Strategy):
             "exit_sma": self.exit_sma,
         }
 
+    def rank_score(self, bars: pd.DataFrame) -> pd.Series:
+        # Most oversold first.
+        return _rsi(bars["close"].astype(float), self.rsi_period)
+
     def signal(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype(float)
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(self.rsi_period).mean()
-        loss = (-delta.clip(upper=0)).rolling(self.rsi_period).mean()
-        rsi = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(100.0).to_numpy()
+        rsi = _rsi(close, self.rsi_period).to_numpy()
         trend_ma = close.rolling(self.trend).mean().to_numpy()
         exit_ma = close.rolling(self.exit_sma).mean().to_numpy()
         c = close.to_numpy()
@@ -153,8 +168,56 @@ class RsiPullback(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+class IbsReversion(Strategy):
+    """Internal-bar-strength mean reversion in an uptrend.
+
+    IBS = (close - low) / (high - low), so 0 means the bar closed on its low.
+    Enter when the close is above its `trend` SMA and IBS is below `entry_ibs`.
+    Exit when IBS rises above `exit_ibs`. Stateful, so it walks the bars in a loop.
+    Bars with zero range get IBS 0.5 and never trigger an entry.
+    """
+
+    name = "ibs_reversion"
+
+    def __init__(self, trend: int = 200, entry_ibs: float = 0.2, exit_ibs: float = 0.8):
+        trend = int(trend)
+        if trend < 2:
+            raise ValueError("ibs_reversion needs trend >= 2")
+        if not 0 <= float(entry_ibs) < float(exit_ibs) <= 1:
+            raise ValueError("ibs_reversion needs 0 <= entry_ibs < exit_ibs <= 1")
+        self.trend = trend
+        self.entry_ibs = float(entry_ibs)
+        self.exit_ibs = float(exit_ibs)
+
+    def params(self) -> dict[str, Any]:
+        return {"trend": self.trend, "entry_ibs": self.entry_ibs, "exit_ibs": self.exit_ibs}
+
+    def _ibs(self, bars: pd.DataFrame) -> pd.Series:
+        rng = (bars["high"] - bars["low"]).replace(0, np.nan)
+        return ((bars["close"] - bars["low"]) / rng).fillna(0.5).astype(float)
+
+    def rank_score(self, bars: pd.DataFrame) -> pd.Series:
+        return self._ibs(bars)
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].astype(float).to_numpy()
+        ibs = self._ibs(bars).to_numpy()
+        trend_ma = bars["close"].astype(float).rolling(self.trend).mean().to_numpy()
+
+        out = np.zeros(len(close), dtype=int)
+        holding = 0
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if holding == 0 and close[i] > trend_ma[i] and ibs[i] < self.entry_ibs:
+                holding = 1
+            elif holding == 1 and ibs[i] > self.exit_ibs:
+                holding = 0
+            out[i] = holding
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
-    s.name: s for s in (BuyAndHold, SmaCrossover, DonchianBreakout, RsiPullback)
+    s.name: s for s in (BuyAndHold, SmaCrossover, DonchianBreakout, RsiPullback, IbsReversion)
 }
 
 

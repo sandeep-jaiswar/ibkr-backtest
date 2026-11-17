@@ -17,6 +17,7 @@ import pandas as pd
 from ibbt import checks, ib_source, report, tracking
 from ibbt.config import Settings
 from ibbt.engine import BacktestConfig
+from ibbt.portfolio import PortfolioConfig
 from ibbt.runner import run_and_record
 from ibbt.store import Store
 from ibbt.strategies import REGISTRY
@@ -309,6 +310,59 @@ def cmd_walk_forward(args: argparse.Namespace) -> int:
     return 0
 
 
+def _portfolio_base(args: argparse.Namespace) -> PortfolioConfig:
+    return PortfolioConfig(
+        initial_cash=args.cash,
+        max_positions=args.slots,
+        position_size=args.size,
+        min_position_size=args.min_size,
+        commission_bps=args.commission_bps,
+        slippage_bps=args.slippage_bps,
+    )
+
+
+def _add_portfolio_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--cash", type=float, default=10_000.0, help="starting account value")
+    p.add_argument("--slots", type=int, default=5, help="max open positions")
+    p.add_argument("--size", type=float, default=2_000.0, help="dollars per position")
+    p.add_argument("--min-size", type=float, default=1_000.0, help="skip entries funded with less than this")
+    p.add_argument("--commission-bps", type=float, default=5.0)
+    p.add_argument("--slippage-bps", type=float, default=5.0)
+
+
+def cmd_portfolio_search(args: argparse.Namespace) -> int:
+    from ibbt.portfolio_search import GOAL, LEADERBOARD_COLS, search
+
+    settings = Settings.from_env()
+    run_id, table = search(
+        settings.duckdb_path,
+        settings,
+        base=_portfolio_base(args),
+        hypothesis=args.hypothesis,
+        note=args.note,
+        symbols=args.symbols,
+        strategies=args.strategies,
+    )
+    cols = ["candidate", "goal_met", *LEADERBOARD_COLS]
+    print(table[cols].head(args.top).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    print(
+        f"\n{int(table['goal_met'].sum())} of {len(table)} candidates pass goal {GOAL} on train and valid. "
+        f"MLflow parent run {run_id}"
+    )
+    return 0
+
+
+def cmd_portfolio_holdout(args: argparse.Namespace) -> int:
+    from ibbt.portfolio_search import pick_best, run_holdout
+
+    settings = Settings.from_env()
+    child = args.run_id or pick_best(settings)
+    print(f"holdout check on candidate run {child}")
+    metrics = run_holdout(settings.duckdb_path, settings, child_run_id=child, base=_portfolio_base(args))
+    _print_metrics(metrics)
+    return 0
+
+
 def cmd_runs(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     with Store(settings.duckdb_path) as store:
@@ -356,6 +410,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--symbols", nargs="*", help="default: every symbol in the database")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("portfolio-search", help="portfolio-level search (train/valid), logged to MLflow")
+    _add_portfolio_args(p)
+    p.add_argument("--hypothesis", required=True, help="what this round tests, stored as an MLflow tag")
+    p.add_argument("--note", default="")
+    p.add_argument("--symbols", nargs="*", help="default: every symbol with enough history")
+    p.add_argument("--strategies", nargs="*", choices=sorted(REGISTRY), help="default: all with a grid")
+    p.add_argument("--top", type=int, default=15, help="rows to print")
+    p.set_defaults(func=cmd_portfolio_search)
+
+    p = sub.add_parser("portfolio-holdout", help="one-time holdout check (2023 onward) on a search candidate")
+    _add_portfolio_args(p)
+    p.add_argument("--run-id", help="MLflow child run of a search candidate; default: best passing candidate")
+    p.set_defaults(func=cmd_portfolio_holdout)
 
     p = sub.add_parser("sweep", help="grid-search strategy parameters; each run is an MLflow child")
     _add_backtest_args(p)
