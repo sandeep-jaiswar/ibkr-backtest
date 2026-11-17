@@ -2210,6 +2210,161 @@ class KaufmanAdaptiveChannel(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+def _breakout_pressure(src: np.ndarray, upper: np.ndarray, lower: np.ndarray, tick: float) -> np.ndarray:
+    """Pine `breakoutPressure`: position of src inside the channel, in [-1, 1] inside, saturating outside."""
+    width = np.maximum(upper - lower, tick)
+    mid = (upper + lower) * 0.5
+    half = np.maximum(width * 0.5, tick)
+    pos = (src - mid) / half
+    with np.errstate(invalid="ignore", divide="ignore"):
+        exc_hi = pos - 1.0
+        exc_lo = pos + 1.0
+        hi = 0.5 + 0.5 * (exc_hi / (1.0 + np.abs(exc_hi)))
+        lo = -0.5 + 0.5 * (exc_lo / (1.0 + np.abs(exc_lo)))
+    return np.where(pos > 1.0, hi, np.where(pos < -1.0, lo, pos * 0.5))
+
+
+class AdaptiveBreakoutOscillator(Strategy):
+    """Port of the Pine script "Adaptive Breakout Oscillator" (SchizoQuant), as a long/flat strategy.
+
+    Three completed channels (highest high / lowest low over the prior short, medium and long lengths, one bar late).
+    Each channel's breakout pressure is the position of src inside it, mapped to [-1, 1] and saturating outside.
+    Compression = ratio / (1 + ratio) where ratio = RMA(width, comp_len) / width, clamped to [0, 1].
+    Urgency = 0.5 + 0.5 |pressure|. Weight = min_weight + (1 - min_weight) * compression * urgency.
+    Consensus = weighted mean of the pressures, clamped to [-1, 1]. Dispersion = weighted mean absolute gap to consensus.
+    Threshold = clamp(base_threshold + dispersion * adaptation, base_threshold, max_threshold).
+    Oscillator = 100 * consensus; the bands are +/- 100 * threshold.
+    Regime latch (starts from oscillator >= 0 on the first bar): oscillator > upper sets +1 (long);
+    oscillator < lower sets -1 (flat). Warm-up NaN weights give consensus 0, as in the script.
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    `mintick` stands in for Pine's syminfo.mintick.
+    """
+
+    name = "adaptive_breakout_osc"
+
+    def __init__(
+        self,
+        source: str = "close",
+        short_len: int = 10,
+        medium_len: int = 20,
+        long_len: int = 40,
+        comp_len: int = 50,
+        min_weight: float = 0.15,
+        base_threshold: float = 0.30,
+        adaptation: float = 0.40,
+        max_threshold: float = 0.65,
+        mintick: float = 0.01,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("adaptive_breakout_osc source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.short_len = int(short_len)
+        self.medium_len = int(medium_len)
+        self.long_len = int(long_len)
+        self.comp_len = int(comp_len)
+        self.min_weight = float(min_weight)
+        self.base_threshold = float(base_threshold)
+        self.adaptation = float(adaptation)
+        self.max_threshold = float(max_threshold)
+        self.mintick = float(mintick)
+        if not 2 <= self.short_len < self.medium_len < self.long_len or self.long_len < 4:
+            raise ValueError("adaptive_breakout_osc needs 2 <= short_len < medium_len < long_len")
+        if self.comp_len < 5:
+            raise ValueError("adaptive_breakout_osc needs comp_len >= 5")
+        if not 0.0 <= self.min_weight <= 1.0 or not 0.05 <= self.base_threshold <= 0.9:
+            raise ValueError("adaptive_breakout_osc: min_weight in [0, 1], base_threshold in [0.05, 0.9]")
+        if not 0.0 <= self.adaptation <= 1.0 or not 0.10 <= self.max_threshold <= 0.95 or self.mintick <= 0:
+            raise ValueError("adaptive_breakout_osc: adaptation in [0, 1], max_threshold in [0.1, 0.95], mintick > 0")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "short_len": self.short_len,
+            "medium_len": self.medium_len,
+            "long_len": self.long_len,
+            "comp_len": self.comp_len,
+            "min_weight": self.min_weight,
+            "base_threshold": self.base_threshold,
+            "adaptation": self.adaptation,
+            "max_threshold": self.max_threshold,
+            "mintick": self.mintick,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def oscillator(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (oscillator, upper, lower) arrays aligned with bars, on the script's 0-100 scale."""
+        src = self._source(bars).to_numpy()
+        h = bars["high"].astype(float)
+        lo = bars["low"].astype(float)
+        hv, lv = h.to_numpy(), lo.to_numpy()
+        tick = self.mintick
+
+        def channel(length: int) -> tuple[np.ndarray, np.ndarray]:
+            hi_p = pd.Series(hv).rolling(length).max().shift(1).to_numpy()
+            lo_p = pd.Series(lv).rolling(length).min().shift(1).to_numpy()
+            return np.where(np.isnan(hi_p), hv, hi_p), np.where(np.isnan(lo_p), lv, lo_p)
+
+        pressures, widths = [], []
+        for length in (self.short_len, self.medium_len, self.long_len):
+            hi_c, lo_c = channel(length)
+            widths.append(np.maximum(hi_c - lo_c, tick))
+            pressures.append(_breakout_pressure(src, hi_c, lo_c, tick))
+
+        weights = []
+        for width, pressure in zip(widths, pressures):
+            base = _rma(width, self.comp_len)  # NaN until seeded, as in the script
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ratio = np.where(width > 0.0, base / width, 1.0)
+                comp = np.maximum(0.0, np.minimum(1.0, ratio / (1.0 + ratio)))
+            urgency = 0.5 + 0.5 * np.abs(pressure)
+            weights.append(self.min_weight + (1.0 - self.min_weight) * comp * urgency)
+
+        total = weights[0] + weights[1] + weights[2]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            consensus = np.where(total > 0.0, (pressures[0] * weights[0] + pressures[1] * weights[1] + pressures[2] * weights[2]) / total, 0.0)
+            consensus = np.maximum(-1.0, np.minimum(1.0, consensus))
+            disp = np.where(
+                total > 0.0,
+                (
+                    np.abs(pressures[0] - consensus) * weights[0]
+                    + np.abs(pressures[1] - consensus) * weights[1]
+                    + np.abs(pressures[2] - consensus) * weights[2]
+                )
+                / total,
+                0.0,
+            )
+        disp = np.maximum(0.0, np.minimum(1.0, disp))
+
+        thr = self.base_threshold + disp * self.adaptation
+        thr = np.maximum(self.base_threshold, np.minimum(self.max_threshold, thr))
+        return consensus * 100.0, thr * 100.0, -thr * 100.0
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        osc, upper, lower = self.oscillator(bars)
+
+        out = np.zeros(len(osc), dtype=int)
+        regime = 1 if osc[0] >= 0.0 else -1  # `var int SQ = oscillator >= 0 ? 1 : -1`
+        for i in range(len(osc)):
+            # NaN comparisons are false, so an undefined oscillator keeps the regime.
+            if osc[i] > upper[i]:
+                regime = 1
+            elif osc[i] < lower[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -2234,6 +2389,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         AdaptiveSuperSmoother,
         AdxLifecycleTrail,
         KaufmanAdaptiveChannel,
+        AdaptiveBreakoutOscillator,
     )
 }
 

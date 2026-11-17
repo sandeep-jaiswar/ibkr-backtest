@@ -525,3 +525,29 @@ def test_kaufman_adaptive_channel_rejects_bad_params():
         KaufmanAdaptiveChannel(er_len=1)
     with pytest.raises(ValueError):
         KaufmanAdaptiveChannel(structure_influence=3.0)
+
+
+def test_adaptive_breakout_oscillator_regimes():
+    """Starts from a flat oscillator (regime long), follows a rally, and flips flat on a sustained selloff."""
+    import numpy as np
+    from ibbt.strategies import AdaptiveBreakoutOscillator
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    strat = AdaptiveBreakoutOscillator()
+    osc, upper, lower = strat.oscillator(bars)
+    assert np.isfinite(osc[60:]).all()
+    sig = strat.signal(bars)
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_adaptive_breakout_oscillator_rejects_bad_params():
+    from ibbt.strategies import AdaptiveBreakoutOscillator
+
+    with pytest.raises(ValueError):
+        AdaptiveBreakoutOscillator(short_len=20, medium_len=10)
+    with pytest.raises(ValueError):
+        AdaptiveBreakoutOscillator(max_threshold=1.5)
