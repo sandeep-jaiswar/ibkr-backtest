@@ -354,3 +354,35 @@ def test_volatility_adaptive_trend_rejects_bad_params():
         VolatilityAdaptiveTrend(min_sc=0.0)
     with pytest.raises(ValueError):
         VolatilityAdaptiveTrend(filter_len=1)
+
+
+def test_mesa_phase_activity_is_bounded_and_flat_on_constant_price():
+    import numpy as np
+    from ibbt.strategies import _mesa_phase_activity
+
+    act = _mesa_phase_activity(np.linspace(100, 120, 300), 0.5, 0.05)
+    assert np.all((act >= 0) & (act <= 1))
+    assert np.isfinite(act).all()
+
+
+def test_mesa_phase_band_trend_breakouts():
+    import numpy as np
+    from ibbt.strategies import MesaPhaseBandTrend
+
+    n = 260
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    close = np.r_[np.linspace(100, 150, 130), np.linspace(150, 90, 130)]
+    bars = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    sig = MesaPhaseBandTrend().signal(bars)
+    assert sig.iloc[:20].sum() == 0
+    assert sig.iloc[125] == 1
+    assert sig.iloc[-1] == 0
+
+
+def test_mesa_phase_band_rejects_bad_params():
+    from ibbt.strategies import MesaPhaseBandTrend
+
+    with pytest.raises(ValueError):
+        MesaPhaseBandTrend(fast_limit=0.0)
+    with pytest.raises(ValueError):
+        MesaPhaseBandTrend(trend_len=1)

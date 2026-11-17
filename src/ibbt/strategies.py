@@ -1244,6 +1244,194 @@ class VolatilityAdaptiveTrend(Strategy):
         return pd.Series(out, index=bars.index, dtype=int)
 
 
+def _mesa_phase_activity(src: np.ndarray, fast_limit: float, slow_limit: float) -> np.ndarray:
+    """Hilbert-transform phase activity, following the Pine script line by line (Ehlers MESA style).
+
+    Each stage feeds the next bar. Pine's nz(x) is x with NaN replaced by 0, and nz(x, d) uses d.
+    phase uses math.atan without quadrant correction, as the script does.
+    Returns phaseActivity in [0, 1] for each bar.
+    """
+    import math
+
+    def nan_to(v: float, d: float) -> float:
+        return d if v != v else v
+
+    def mn(a: float, b: float) -> float:  # Pine math.min: NaN propagates
+        return float("nan") if (a != a or b != b) else min(a, b)
+
+    def mx(a: float, b: float) -> float:  # Pine math.max: NaN propagates
+        return float("nan") if (a != a or b != b) else max(a, b)
+
+    n = len(src)
+    nan = float("nan")
+    smooth = [nan] * n
+    det = [nan] * n
+    q1 = [nan] * n
+    i1 = [nan] * n
+    i2 = [nan] * n
+    q2 = [nan] * n
+    re = [nan] * n
+    im = [nan] * n
+    period = [nan] * n
+    phase = [nan] * n
+    activity = np.zeros(n)
+
+    def back(arr: list, k: int, default: float) -> float:
+        """arr[t - k] with Pine's nz default; the caller's t is the loop index."""
+        j = t - k
+        if j < 0:
+            return default
+        return nan_to(arr[j], default)
+
+    def hilbert(x: list, t_val: float, pf: float) -> float:
+        return (0.0962 * t_val + 0.5769 * back(x, 2, 0.0) - 0.5769 * back(x, 4, 0.0) - 0.0962 * back(x, 6, 0.0)) * pf
+
+    for t in range(n):
+        s0 = float(src[t])
+        smooth_t = (
+            4.0 * s0
+            + 3.0 * (float(src[t - 1]) if t >= 1 and src[t - 1] == src[t - 1] else s0)
+            + 2.0 * (float(src[t - 2]) if t >= 2 and src[t - 2] == src[t - 2] else s0)
+            + (float(src[t - 3]) if t >= 3 and src[t - 3] == src[t - 3] else s0)
+        ) / 10.0
+        smooth[t] = smooth_t
+
+        prev_period = back(period, 1, 10.0)
+        pf = 0.075 * prev_period + 0.54
+
+        det_t = hilbert(smooth, smooth_t, pf)
+        det[t] = det_t
+        q1_t = hilbert(det, det_t, pf)
+        q1[t] = q1_t
+        i1_t = back(det, 3, 0.0)
+        i1[t] = i1_t
+        ji = (0.0962 * i1_t + 0.5769 * back(i1, 2, 0.0) - 0.5769 * back(i1, 4, 0.0) - 0.0962 * back(i1, 6, 0.0)) * pf
+        jq = (0.0962 * q1_t + 0.5769 * back(q1, 2, 0.0) - 0.5769 * back(q1, 4, 0.0) - 0.0962 * back(q1, 6, 0.0)) * pf
+
+        i2_t = 0.2 * (i1_t - jq) + 0.8 * back(i2, 1, 0.0)
+        q2_t = 0.2 * (q1_t + ji) + 0.8 * back(q2, 1, 0.0)
+        i2[t] = i2_t
+        q2[t] = q2_t
+
+        re_raw = i2_t * back(i2, 1, 0.0) + q2_t * back(q2, 1, 0.0)
+        im_raw = i2_t * back(q2, 1, 0.0) - q2_t * back(i2, 1, 0.0)
+        re_t = 0.2 * re_raw + 0.8 * back(re, 1, 0.0)
+        im_t = 0.2 * im_raw + 0.8 * back(im, 1, 0.0)
+        re[t] = re_t
+        im[t] = im_t
+
+        angle = math.degrees(math.atan(im_t / re_t)) if re_t != 0.0 else 0.0
+        raw = abs(360.0 / angle) if angle != 0.0 else prev_period
+        lim = mn(raw, 1.5 * prev_period)
+        lim = mx(lim, 0.67 * prev_period)
+        lim = mx(6.0, mn(50.0, lim))
+        period_t = 0.2 * lim + 0.8 * prev_period
+        period[t] = period_t
+
+        phase_t = math.degrees(math.atan(q1_t / i1_t)) if i1_t != 0.0 else back(phase, 1, 0.0)
+        phase[t] = phase_t
+        delta = mx(back(phase, 1, 0.0) - phase_t, 1.0)
+        alpha = mx(fast_limit / delta, slow_limit)
+        phase_range = mx(fast_limit - slow_limit, 0.0001)
+        activity[t] = mx(0.0, mn(1.0, (alpha - slow_limit) / phase_range))
+    return activity
+
+
+class MesaPhaseBandTrend(Strategy):
+    """Port of the Pine script "MESA Phase-Adaptive Band Trend" (SchizoQuant), as a long/flat strategy.
+
+    Phase activity: the Ehlers MESA Hilbert-transform phase, turned into an activity measure in [0, 1]
+    (see `_mesa_phase_activity`). A stateful Pine-line port.
+    Trend = EMA(src, trend_len). Volatility = population stdev of simple returns over vol_len, taken one bar late.
+    Band multiplier = slow_mult - (slow_mult - active_mult) * activity, so the band is narrow when phase is active.
+    Upper = trend + mult * volatility * trend; lower = trend - mult * volatility * trend.
+    Regime latch (starts flat): close > upper sets +1 (long); close < lower sets -1 (flat).
+    Long while the regime is +1, flat otherwise. The engine trades the next open. Only past and present bars are used.
+    """
+
+    name = "mesa_phase_band"
+
+    def __init__(
+        self,
+        source: str = "hl2",
+        fast_limit: float = 0.50,
+        slow_limit: float = 0.05,
+        trend_len: int = 20,
+        vol_len: int = 20,
+        active_mult: float = 1.5,
+        slow_mult: float = 3.0,
+    ):
+        if source not in ("open", "high", "low", "close", "hl2", "hlc3", "ohlc4"):
+            raise ValueError("mesa_phase_band source must be one of open, high, low, close, hl2, hlc3, ohlc4")
+        self.source = source
+        self.fast_limit = float(fast_limit)
+        self.slow_limit = float(slow_limit)
+        self.trend_len = int(trend_len)
+        self.vol_len = int(vol_len)
+        self.active_mult = float(active_mult)
+        self.slow_mult = float(slow_mult)
+        if not 0.01 <= self.fast_limit <= 1.0 or not 0.001 <= self.slow_limit <= 1.0:
+            raise ValueError("mesa_phase_band limits must be in [0.01, 1] (fast) and [0.001, 1] (slow)")
+        if self.trend_len < 2 or self.vol_len < 2:
+            raise ValueError("mesa_phase_band needs trend_len >= 2 and vol_len >= 2")
+        if self.active_mult < 0.1 or self.slow_mult < 0.1:
+            raise ValueError("mesa_phase_band multipliers must be >= 0.1")
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "fast_limit": self.fast_limit,
+            "slow_limit": self.slow_limit,
+            "trend_len": self.trend_len,
+            "vol_len": self.vol_len,
+            "active_mult": self.active_mult,
+            "slow_mult": self.slow_mult,
+        }
+
+    def _source(self, bars: pd.DataFrame) -> pd.Series:
+        o, h, lo, c = (bars[k].astype(float) for k in ("open", "high", "low", "close"))
+        return {
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "hl2": (h + lo) / 2,
+            "hlc3": (h + lo + c) / 3,
+            "ohlc4": (o + h + lo + c) / 4,
+        }[self.source]
+
+    def bands(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        src_s = self._source(bars)
+        src = src_s.to_numpy()
+        activity = _mesa_phase_activity(src, self.fast_limit, self.slow_limit)
+
+        trend = _ema(src, self.trend_len)
+        prev = src_s.shift(1).to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ret = np.where(prev != 0.0, (src - prev) / prev, 0.0)
+        vol = pd.Series(ret).rolling(self.vol_len).std(ddof=0).shift(1).to_numpy()
+
+        mult = self.slow_mult - (self.slow_mult - self.active_mult) * activity
+        upper = trend + mult * vol * trend
+        lower = trend - mult * vol * trend
+        return trend, upper, lower
+
+    def signal(self, bars: pd.DataFrame) -> pd.Series:
+        _, upper, lower = self.bands(bars)
+        close = bars["close"].astype(float).to_numpy()
+
+        out = np.zeros(len(close), dtype=int)
+        regime = 0  # `var int SQ = 0`
+        for i in range(len(close)):
+            # NaN comparisons are False, so the warm-up period stays flat.
+            if close[i] > upper[i]:
+                regime = 1
+            elif close[i] < lower[i]:
+                regime = -1
+            out[i] = int(regime == 1)
+        return pd.Series(out, index=bars.index, dtype=int)
+
+
 REGISTRY: dict[str, type[Strategy]] = {
     s.name: s
     for s in (
@@ -1262,6 +1450,7 @@ REGISTRY: dict[str, type[Strategy]] = {
         DoubleSmoothedMadTrend,
         AdaptiveEhlersPercentile,
         VolatilityAdaptiveTrend,
+        MesaPhaseBandTrend,
     )
 }
 
