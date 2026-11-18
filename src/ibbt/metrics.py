@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import empyrical as ep
 import pandas as pd
 
 
@@ -18,14 +19,15 @@ def compute_metrics(
 
     rets = equity.pct_change().dropna()
     total_return = equity.iloc[-1] / equity.iloc[0] - 1
+    # Calendar-year CAGR, kept on purpose so stored runs stay comparable (empyrical counts periods instead).
     years = (equity.index[-1] - equity.index[0]).days / 365.25
     cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 and total_return > -1 else math.nan
 
-    ret_std = rets.std(ddof=1)
-    ann_vol = ret_std * math.sqrt(periods_per_year)
-    sharpe = rets.mean() / ret_std * math.sqrt(periods_per_year) if ret_std > 0 else math.nan
+    # Library-backed risk metrics (empyrical). Values match the previous hand-written formulas.
+    ann_vol = float(ep.annual_volatility(rets, annualization=periods_per_year))
+    sharpe = float(ep.sharpe_ratio(rets, risk_free=0.0, annualization=periods_per_year))
+    max_drawdown = float(ep.max_drawdown(rets))
 
-    max_drawdown = (equity / equity.cummax() - 1).min()
     calmar = cagr / abs(max_drawdown) if max_drawdown < 0 and not math.isnan(cagr) else math.nan
 
     closed = trades.loc[~trades["open"].astype(bool)] if not trades.empty else trades

@@ -22,15 +22,11 @@ MLflow layout (experiment `ibkr-portfolio`):
 
 from __future__ import annotations
 
-import itertools
 import json
 import math
-import multiprocessing as mp
-import os
 import re
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
@@ -45,6 +41,7 @@ from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID
 
 from ibbt.config import Settings
 from ibbt.portfolio import PortfolioConfig, portfolio_metrics, run_portfolio
+from ibbt.space import expand_space
 from ibbt.strategies import REGISTRY, make_strategy
 
 EXPERIMENT = "ibkr-portfolio"
@@ -141,16 +138,13 @@ def expand_candidates(
     exit_grid: dict[str, list[Any]] = EXIT_GRID,
     strategies: list[str] | None = None,
 ) -> list[Candidate]:
-    exit_keys = list(exit_grid)
-    exit_combos = [dict(zip(exit_keys, v, strict=True)) for v in itertools.product(*exit_grid.values())]
+    exit_combos = expand_space(exit_grid)
     level_combos = [{"stop_pct": None, "target_pct": None, "max_hold": h} for h in LEVEL_MAX_HOLD]
     out: list[Candidate] = []
     for name, space in strategy_grid.items():
         if strategies and name not in strategies:
             continue
-        keys = list(space)
-        for values in itertools.product(*(space[k] for k in keys)):
-            params = dict(zip(keys, values, strict=True))
+        for params in expand_space(space):
             try:
                 make_strategy(name, params)
             except ValueError:
@@ -477,6 +471,36 @@ def _eval_group(cands: list[Candidate]) -> list[dict[str, Any]]:
     return [evaluate(_UNIV, c, _BASE, cache) for c in cands]
 
 
+def _leaderboard(evaluated: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "candidate": e["candidate"].name(),
+                "goal_met": e["goal_met"],
+                **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
+            }
+            for e in evaluated
+        ]
+    ).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
+
+
+def _evaluate_batch(cands: list[Candidate], workers: int | None) -> list[dict[str, Any] | None]:
+    """Score candidates, one worker task per strategy config (its signal panel is shared across exit rules).
+
+    Results come back in the order of `cands`. A candidate that cannot be scored comes back as None.
+    """
+    from ibbt.parallel import pmap
+
+    groups: dict[tuple, list[Candidate]] = {}
+    for c in cands:
+        groups.setdefault((c.strategy, c.strategy_params), []).append(c)
+    by_name: dict[str, dict[str, Any]] = {}
+    for group_result in pmap(_eval_group, groups.values(), workers):
+        for ev in group_result:
+            by_name[ev["candidate"].to_json()] = ev
+    return [by_name.get(c.to_json()) for c in cands]
+
+
 def search(
     db_path: str | Path,
     settings: Settings,
@@ -489,28 +513,59 @@ def search(
     experiment: str = EXPERIMENT,
     workers: int | None = None,
     exit_grid: dict[str, list[Any]] = EXIT_GRID,
+    method: str = "optuna",
+    n_trials: int = 200,
+    seed: int = 0,
+    batch_size: int | None = None,
 ) -> tuple[str, pd.DataFrame]:
+    """Search portfolio candidates on the train and valid windows and log the round to MLflow.
+
+    method="optuna" (default): Optuna TPE proposes candidates in batches, scored by the objective in
+    `optuna_search.score_metrics`. method="grid": every candidate in the space is scored once.
+    The holdout is never evaluated here.
+    """
+    if method not in ("optuna", "grid"):
+        raise ValueError(f"method must be 'optuna' or 'grid', got {method!r}")
     cands = expand_candidates(strategies=strategies, exit_grid=exit_grid)
     if not cands:
         raise ValueError(
             f"no candidates: none of the requested strategies has a search grid "
             f"(strategies={strategies}, searchable: {sorted(STRATEGY_GRID)})"
         )
+    from ibbt.parallel import default_workers
+
     global _UNIV, _BASE
     univ = load_universe(db_path, symbols)
     _UNIV, _BASE = univ, base
-    groups: dict[tuple, list[Candidate]] = {}
-    for cand in cands:
-        groups.setdefault((cand.strategy, cand.strategy_params), []).append(cand)
+    n_workers = workers or default_workers()
 
-    evaluated: list[dict[str, Any]] = []
-    # Each worker holds its own pandas copies of the universe, so memory bounds the worker count (7 GB RAM here).
-    default_workers = int(os.getenv("IBBT_WORKERS", str(os.cpu_count() or 1)))
-    n_workers = min(workers or default_workers, len(groups))
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("fork")) as pool:
-        for k, group_result in enumerate(pool.map(_eval_group, groups.values()), 1):
-            evaluated.extend(group_result)
-            print(f"{k}/{len(groups)} strategy configs ({len(evaluated)}/{len(cands)} candidates)", flush=True)
+    def evaluate_batch(batch: list[Candidate]) -> list[dict[str, Any] | None]:
+        return _evaluate_batch(batch, n_workers)
+
+    if method == "grid":
+        evaluated = [e for e in evaluate_batch(cands) if e is not None]
+        run_note = f"{note} [method=grid space_size={len(cands)} unique_evaluated={len(evaluated)}]"
+    else:
+        from ibbt.optuna_search import optimize
+
+        grid = {k: v for k, v in STRATEGY_GRID.items() if not strategies or k in strategies}
+        # Each batch should hold at least one candidate per worker, or workers sit idle.
+        batch = batch_size or max(16, 2 * n_workers)
+        evaluated = optimize(
+            evaluate_batch,
+            n_trials=n_trials,
+            seed=seed,
+            batch_size=batch,
+            strategy_grid=grid,
+            exit_grid=exit_grid,
+        )
+        if not evaluated:
+            raise ValueError("optuna search produced no runnable candidates; increase n_trials")
+        run_note = (
+            f"{note} [method=optuna trials={n_trials} seed={seed} batch={batch} "
+            f"space_size={len(cands)} unique_evaluated={len(evaluated)}]"
+        )
+
     run_id = log_round(
         evaluated,
         settings=settings,
@@ -518,20 +573,10 @@ def search(
         n_symbols=univ.n_symbols,
         excluded_for_quality=univ.excluded_for_quality,
         hypothesis=hypothesis,
-        note=note,
+        note=run_note.strip(),
         experiment=experiment,
     )
-    table = pd.DataFrame(
-        [
-            {
-                "candidate": e["candidate"].name(),
-                "goal_met": e["goal_met"],
-                **{k: v for k, v in _flat_metrics(e["results"]).items() if k in LEADERBOARD_COLS},
-            }
-            for e in evaluated
-        ]
-    ).sort_values(["goal_met", "valid_profit_factor"], ascending=[False, False])
-    return run_id, table
+    return run_id, _leaderboard(evaluated)
 
 
 def run_holdout(

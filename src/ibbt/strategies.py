@@ -13,6 +13,9 @@ from typing import Any, ClassVar
 import numpy as np
 import pandas as pd
 
+from ibbt.indicators import ema as _ema
+from ibbt.indicators import rma as _rma
+
 
 class Strategy(ABC):
     name: ClassVar[str]
@@ -569,36 +572,6 @@ class ChampionDailySetup(Strategy):
             & (c > lo + 0.6 * (h - lo))
         )
         return cond.fillna(False).astype(int).rename("signal")
-
-
-def _rma(x: np.ndarray, n: int) -> np.ndarray:
-    """Wilder's moving average, matching Pine's `ta.rma` (alpha = 1/n)."""
-    return _seeded_average(x, n, 1.0 / n)
-
-
-def _ema(x: np.ndarray, n: int) -> np.ndarray:
-    """Exponential moving average, matching Pine's `ta.ema` (alpha = 2/(n+1)), seeded like `_rma`."""
-    return _seeded_average(x, n, 2.0 / (n + 1))
-
-
-def _seeded_average(x: np.ndarray, n: int, alpha: float) -> np.ndarray:
-    """Pine-style recursive average.
-
-    Seeded with the simple average of the first `n` finite values, then
-    avg_t = avg_{t-1} + alpha * (x_t - avg_{t-1}). NaN inputs are skipped and leave the average unchanged.
-    """
-    out = np.full(len(x), np.nan)
-    finite = np.flatnonzero(np.isfinite(x))
-    if len(finite) < n:
-        return out
-    seed_pos = finite[n - 1]  # the bar where n finite values are available
-    prev = float(np.mean(x[finite[:n]]))
-    out[seed_pos] = prev
-    for i in range(seed_pos + 1, len(x)):
-        if np.isfinite(x[i]):
-            prev = alpha * x[i] + (1 - alpha) * prev
-            out[i] = prev
-    return out
 
 
 class RmaAtrBands(Strategy):

@@ -13,6 +13,10 @@ dependencies = [
     "mlflow>=3.0",
     "pandas>=2.2,<3",
     "numpy>=1.26",
+    "empyrical-reloaded>=0.5.9",
+    "pandas-ta-classic>=0.9",
+    "quantstats>=0.0.80",
+    "optuna>=4.0",
 ]
 
 [project.optional-dependencies]

@@ -8,7 +8,6 @@ not just in one name. Costs come from BacktestConfig (commission and slippage pe
 
 from __future__ import annotations
 
-import itertools
 import math
 from dataclasses import dataclass
 from datetime import date
@@ -19,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from ibbt.engine import BacktestConfig, run_backtest
+from ibbt.space import expand_space
 from ibbt.strategies import make_strategy
 
 DEFAULT_GRID: dict[str, dict[str, list[Any]]] = {
@@ -33,11 +33,7 @@ def expand_grid(grid: dict[str, dict[str, list[Any]]] = DEFAULT_GRID) -> list[tu
     """Every valid parameter combination; combinations a strategy rejects (e.g. fast >= slow) are dropped."""
     configs: list[tuple[str, dict[str, Any]]] = []
     for name, space in grid.items():
-        keys = list(space)
-        for values in itertools.product(*(space[k] for k in keys)):
-            # keys and values come from the same space, so the lengths always match. An empty space
-            # still yields one empty combination from itertools.product, which covers no-parameter strategies.
-            params = dict(zip(keys, values, strict=True))
+        for params in expand_space(space):
             try:
                 make_strategy(name, params)
             except ValueError:
@@ -70,40 +66,71 @@ def load_bars(con: duckdb.DuckDBPyConnection, symbol: str) -> pd.DataFrame:
     return df.set_index("ts")
 
 
+def _symbol_pools(
+    symbol: str,
+    db_path: str,
+    split_ts: pd.Timestamp,
+    configs: list[tuple[str, dict[str, Any]]],
+    cfg: BacktestConfig,
+) -> list[tuple[list[float], list[float]]] | None:
+    """Closed-trade P&L per config for one symbol, as (in-sample, out-of-sample). Runs in a worker.
+
+    The worker opens its own read-only DuckDB connection: connections must not cross a fork.
+    """
+    con = duckdb.connect(db_path, read_only=True)
+    try:
+        bars = load_bars(con, symbol)
+    finally:
+        con.close()
+    if len(bars) < 250:  # too short to say anything; skip rather than pad with noise
+        return None
+    out: list[tuple[list[float], list[float]]] = []
+    for name, params in configs:
+        signal = make_strategy(name, params).signal(bars)
+        pair: list[list[float]] = []
+        for mask in (bars.index < split_ts, bars.index >= split_ts):
+            part = bars[mask]
+            if len(part) < 2:
+                pair.append([])
+                continue
+            result = run_backtest(part, signal.reindex(part.index), cfg)
+            closed = result.trades.loc[~result.trades["open"].astype(bool)]
+            pair.append(closed["pnl_pct"].astype(float).tolist())
+        out.append((pair[0], pair[1]))
+    return out
+
+
 def run_search(
     db_path: str,
     split: date,
     symbols: list[str] | None = None,
     cfg: BacktestConfig | None = None,
     grid: dict[str, dict[str, list[Any]]] = DEFAULT_GRID,
-    progress_every: int = 200,
 ) -> pd.DataFrame:
+    """Per-symbol search with an in-sample / out-of-sample split. Symbols run in parallel; results are merged
+    in symbol order so the pooled statistics match a serial run exactly."""
+    from functools import partial
+
+    from ibbt.parallel import pmap
+
     cfg = cfg or BacktestConfig()
     split_ts = pd.Timestamp(split)
-    con = duckdb.connect(db_path, read_only=True)
     if symbols is None:
+        con = duckdb.connect(db_path, read_only=True)
         symbols = [r[0] for r in con.execute("SELECT DISTINCT symbol FROM bars ORDER BY symbol").fetchall()]
+        con.close()
 
     configs = expand_grid(grid)
     pools = {(i, "is"): Pool([]) for i in range(len(configs))}
     pools.update({(i, "oos"): Pool([]) for i in range(len(configs))})
 
-    for n, symbol in enumerate(symbols, 1):
-        bars = load_bars(con, symbol)
-        if len(bars) < 250:  # too short to say anything; skip rather than pad with noise
+    per_symbol = pmap(partial(_symbol_pools, db_path=db_path, split_ts=split_ts, configs=configs, cfg=cfg), symbols)
+    for symbol_result in per_symbol:  # symbol order, as in a serial run
+        if symbol_result is None:
             continue
-        for i, (name, params) in enumerate(configs):
-            signal = make_strategy(name, params).signal(bars)
-            for period, mask in (("is", bars.index < split_ts), ("oos", bars.index >= split_ts)):
-                part = bars[mask]
-                if len(part) < 2:
-                    continue
-                result = run_backtest(part, signal.reindex(part.index), cfg)
-                closed = result.trades.loc[~result.trades["open"].astype(bool)]
-                pools[(i, period)].pnl.extend(closed["pnl_pct"].astype(float).tolist())
-        if n % progress_every == 0:
-            print(f"{n}/{len(symbols)} symbols", flush=True)
-    con.close()
+        for i, (is_pnl, oos_pnl) in enumerate(symbol_result):
+            pools[(i, "is")].pnl.extend(is_pnl)
+            pools[(i, "oos")].pnl.extend(oos_pnl)
 
     rows = []
     for i, (name, params) in enumerate(configs):

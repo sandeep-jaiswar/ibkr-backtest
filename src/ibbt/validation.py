@@ -89,6 +89,29 @@ def _window_signal(bars: pd.DataFrame, strategy, window: slice) -> pd.Series:
     return strategy.signal(bars.loc[: window.stop]).loc[window]
 
 
+def _grid_entry(
+    item: tuple[int, dict],
+    *,
+    bars: pd.DataFrame,
+    window: slice,
+    strategy_name: str,
+    cfg: BacktestConfig,
+) -> tuple[int, dict | None]:
+    """Metrics for one grid entry on one window, or None if the entry is rejected. Runs in a worker."""
+    pos, params = item
+    try:
+        strategy = make_strategy(strategy_name, params)
+        signal = _window_signal(bars, strategy, window)
+        metrics = _evaluate(bars.loc[window], signal, cfg)
+    except ValueError:
+        return pos, None
+    return pos, {**params, **metrics}
+
+
+# Below this many entries, forking costs more than it saves.
+PARALLEL_GRID_MIN = 16
+
+
 def _grid_results(
     bars: pd.DataFrame,
     window: slice,
@@ -99,17 +122,15 @@ def _grid_results(
     """One row per grid entry that runs (entries raising ValueError are skipped), indexed by grid position.
 
     Each entry's signal is computed on `bars` up to the end of `window`, then the backtest runs on
-    the window's bars alone.
+    the window's bars alone. Entries are scored in parallel; rows are assembled in grid order.
     """
-    rows: dict[int, dict] = {}
-    for pos, params in enumerate(grid):
-        try:
-            strategy = make_strategy(strategy_name, params)
-            signal = _window_signal(bars, strategy, window)
-            metrics = _evaluate(bars.loc[window], signal, cfg)
-        except ValueError:
-            continue
-        rows[pos] = {**params, **metrics}
+    from functools import partial
+
+    from ibbt.parallel import pmap
+
+    task = partial(_grid_entry, bars=bars, window=window, strategy_name=strategy_name, cfg=cfg)
+    results = pmap(task, list(enumerate(grid)), min_items=PARALLEL_GRID_MIN)
+    rows = {pos: row for pos, row in results if row is not None}
     return pd.DataFrame.from_dict(rows, orient="index")
 
 

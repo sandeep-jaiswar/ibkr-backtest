@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import itertools
 import re
 import sys
 from datetime import date, timedelta
@@ -19,6 +18,7 @@ from ibbt.config import Settings
 from ibbt.engine import BacktestConfig
 from ibbt.portfolio import PortfolioConfig
 from ibbt.runner import run_and_record
+from ibbt.space import expand_space
 from ibbt.store import BAR_COLUMNS, Store
 from ibbt.strategies import REGISTRY
 from ibbt.synthetic import synthetic_bars
@@ -262,32 +262,39 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
+    from ibbt.runner import compute_grid, record_run
+
     settings = Settings.from_env()
     grid = _parse_grid(args.grid)
     keys = list(grid)
-    combos = [dict(zip(keys, values, strict=True)) for values in itertools.product(*grid.values())]
+    combos = expand_space(grid)
     rows: list[dict[str, Any]] = []
 
     with Store(settings.duckdb_path) as store:
+        bars = store.load_bars(args.symbol, args.start, args.end)
+        if bars.empty:
+            raise LookupError(
+                f"no stored bars for {args.symbol} between {args.start} and {args.end}; run `ibbt fetch` first"
+            )
+        cfg = _cfg(args)
+        # Compute in parallel; record in this process, one run at a time.
+        computed = compute_grid(bars, args.strategy, combos, cfg)
         tracking.configure(settings)
         with mlflow.start_run(run_name=f"sweep-{args.strategy}-{args.symbol}"):
             mlflow.set_tag("sweep_grid", str(grid))
-            for combo in combos:
-                try:
-                    out = run_and_record(
-                        store=store,
-                        settings=settings,
-                        symbol=args.symbol,
-                        strategy_name=args.strategy,
-                        strategy_params=combo,
-                        start=args.start,
-                        end=args.end,
-                        cfg=_cfg(args),
-                        track=not args.no_track,
-                    )
-                except ValueError as exc:  # e.g. sma fast >= slow
-                    print(f"skipping {combo}: {exc}")
+            for combo, outcome in zip(combos, computed, strict=True):
+                if isinstance(outcome, str):  # e.g. sma fast >= slow
+                    print(f"skipping {combo}: {outcome}")
                     continue
+                out = record_run(
+                    store=store,
+                    settings=settings,
+                    symbol=args.symbol,
+                    start=args.start,
+                    end=args.end,
+                    computed=outcome,
+                    track=not args.no_track,
+                )
                 rows.append({**combo, **out.metrics, "run_id": out.run_id})
 
     if not rows:
@@ -328,8 +335,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
 def cmd_walk_forward(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     grid = _parse_grid(args.grid)
-    keys = list(grid)
-    combos = [dict(zip(keys, values, strict=True)) for values in itertools.product(*grid.values())]
+    combos = expand_space(grid)
     with Store(settings.duckdb_path) as store:
         bars = store.load_bars(args.symbol, args.start, args.end)
     if bars.empty:
@@ -374,6 +380,9 @@ def cmd_portfolio_search(args: argparse.Namespace) -> int:
         symbols=args.symbols,
         strategies=args.strategies,
         exit_grid=EXIT_PRESETS.get(args.exit_preset, EXIT_GRID),
+        method=args.method,
+        n_trials=args.trials,
+        seed=args.seed,
     )
     cols = ["candidate", "goal_met", *LEADERBOARD_COLS]
     print(table[cols].head(args.top).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
@@ -458,6 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--exit-preset", choices=["r1", "r2"], default="r2", help="r1 tight exits, r2 wide exits + time stops"
     )
+    p.add_argument(
+        "--method",
+        choices=["optuna", "grid"],
+        default="optuna",
+        help="optuna: TPE sampler over the space (default); grid: score every candidate once",
+    )
+    p.add_argument("--trials", type=int, default=200, help="optuna: number of trials")
+    p.add_argument("--seed", type=int, default=0, help="optuna: sampler seed, logged to MLflow")
     p.add_argument("--top", type=int, default=15, help="rows to print")
     p.set_defaults(func=cmd_portfolio_search)
 

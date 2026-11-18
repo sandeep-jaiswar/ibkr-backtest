@@ -45,6 +45,7 @@ Settings are read from environment variables:
 | `IBBT_DUCKDB` | `data/market.duckdb` | DuckDB file |
 | `MLFLOW_TRACKING_URI` | `sqlite:///mlflow.db` | MLflow backend |
 | `IBBT_MLFLOW_EXPERIMENT` | `ibkr-backtests` | MLflow experiment name |
+| `IBBT_WORKERS` | CPU count | Worker processes for search, sweep and walk-forward. Each worker holds a copy of the data, so lower it on small machines |
 
 ## Usage
 
@@ -67,8 +68,12 @@ ibbt walk-forward AAPL --grid fast=10,20,50 --grid slow=100,200 --folds 3 --trai
 # 5. Check stored data for gaps and bad bars
 ibbt check AAPL MSFT
 
-# 6. Self-contained HTML tear sheet for a run
+# 6. HTML tear sheet for a run: stored metrics, parameters, trades and quantstats figures
 ibbt report <run_id> --out reports/run.html
+
+# 6b. Portfolio candidate search on train/valid. Optuna (TPE) proposes candidates by default;
+#     --method grid scores the whole space. The run note records the space size and candidates evaluated.
+ibbt portfolio-search --hypothesis "rsi pullback, wide exits" --trials 300 --seed 1
 
 # 7. Inspect stored runs
 ibbt runs
