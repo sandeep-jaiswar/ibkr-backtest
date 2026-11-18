@@ -170,6 +170,29 @@ class Universe:
         return len(self.opens.columns)
 
 
+def screen_corrupt(df: pd.DataFrame) -> tuple[pd.DataFrame, set[str]]:
+    """Causal data-quality screen over bars sorted by symbol and time. Returns (kept bars, cut-off symbols).
+
+    Each bar is judged only from itself and the prior bar, so a decision on date t never depends on data after t.
+    From a symbol's first corrupt bar onward, the symbol is cut off: its later history is dropped, so the test
+    cannot skip a bad stock at the start and keep it afterwards. It works per symbol, so it can run on one symbol.
+    Corrupt means: a non-positive price, an inverted high/low, a high above 4x the low, or a one-day move beyond
+    3x / below 1/3 of the prior close (unit glitches, stale ticks). No absolute price cap: it removed high-priced
+    rupee stocks with no corruption evidence (see data/runs/screen_evidence.md).
+    """
+    prev = df.groupby("symbol")["close"].shift(1)
+    corrupt = (
+        (df["close"] <= 0)
+        | (df["high"] < df["low"])
+        | (df["high"] > 4 * df["low"])
+        | ((prev > 0) & ((df["close"] / prev > 3) | (df["close"] / prev < 1 / 3)))
+    )
+    first_bad = df.loc[corrupt].groupby("symbol")["ts"].min()
+    cutoff = pd.to_datetime(df["symbol"].map(first_bad.to_dict()))
+    kept = df[cutoff.isna() | (df["ts"] < cutoff)]
+    return kept, set(first_bad.index)
+
+
 def load_universe(db_path: str | Path, symbols: list[str] | None = None) -> Universe:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -183,24 +206,7 @@ def load_universe(db_path: str | Path, symbols: list[str] | None = None) -> Univ
         con.close()
     df["ts"] = pd.to_datetime(df["ts"])
     df = df.sort_values(["symbol", "ts"])
-    # Data-quality screen, causal. Each bar is judged only from itself and the prior bar, so a decision on date t
-    # never depends on data after t. From a symbol's first corrupt bar onward, the symbol is cut off: its later
-    # history is dropped, so the test cannot skip a bad stock at the start and keep it afterwards.
-    # Corrupt means: a non-positive price, an inverted high/low, a high above 4x the low,
-    # or a one-day move beyond 3x / below 1/3 of the prior close (unit glitches, stale ticks).
-    # No absolute price cap: it removed high-priced rupee stocks with no corruption evidence
-    # (see data/runs/screen_evidence.md).
-    prev = df.groupby("symbol")["close"].shift(1)
-    corrupt = (
-        (df["close"] <= 0)
-        | (df["high"] < df["low"])
-        | (df["high"] > 4 * df["low"])
-        | ((prev > 0) & ((df["close"] / prev > 3) | (df["close"] / prev < 1 / 3)))
-    )
-    first_bad = df.loc[corrupt].groupby("symbol")["ts"].min()
-    cutoff = pd.to_datetime(df["symbol"].map(first_bad.to_dict()))
-    df = df[cutoff.isna() | (df["ts"] < cutoff)]
-    bad_symbols = set(first_bad.index)
+    df, bad_symbols = screen_corrupt(df)
     # No minimum-history filter over the full span: that would let future bar counts decide inclusion.
     # Indicators stay flat during their own warm-up, so short histories simply produce no trades.
 
